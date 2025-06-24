@@ -51,19 +51,26 @@ use utoipa_swagger_ui::SwaggerUi;
 struct ApiDoc;
 
 pub(crate) fn new(engine: Sender<Engine>) -> Router {
-    let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+    let (router, api) = make_open_api_router();
+    let router = router.with_state(engine);
+    router.merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api))
+}
+
+pub fn api() -> utoipa::openapi::OpenApi {
+    make_open_api_router().1
+}
+
+fn make_open_api_router() -> (Router<Sender<Engine>>, utoipa::openapi::OpenApi) {
+    OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(
             OpenApiRouter::new()
                 .routes(routes!(get_indexes))
                 .routes(routes!(get_index_count))
                 .routes(routes!(post_index_ann))
                 .routes(routes!(get_info))
-                .layer(TraceLayer::new_for_http())
-                .with_state(engine),
+                .layer(TraceLayer::new_for_http()), // .with_state(engine),
         )
-        .split_for_parts();
-
-    router.merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api))
+        .split_for_parts()
 }
 
 #[utoipa::path(
