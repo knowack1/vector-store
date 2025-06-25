@@ -1,2 +1,2 @@
 [alias]
-openapi = "run --bin generate-openapi -- api/openapi.json"
+openapi = "run --features dev-tools --bin generate-openapi -- api/openapi.json"
