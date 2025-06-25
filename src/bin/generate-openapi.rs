@@ -5,11 +5,8 @@ use vector_store::httproutes::api;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
-    let pathname = if args.len() > 1 {
-        &args[1]
-    } else {
-        "openapi.json"
-    };
+    let default_pathname = String::from("openapi.json");
+    let pathname = args.get(1).unwrap_or(&default_pathname);
 
     let openapi = api();
     let json = serde_json::to_string_pretty(&openapi)?;
