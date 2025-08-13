@@ -52,6 +52,12 @@ use uuid::Uuid;
 #[derive(Clone, derive_more::From, derive_more::Display)]
 pub struct ScyllaDbUri(String);
 
+#[derive(Clone, Debug)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
 #[derive(
     Clone, Hash, Eq, PartialEq, Debug, PartialOrd, Ord, derive_more::Display, derive_more::AsRef,
 )]
@@ -458,8 +464,12 @@ pub async fn run(
     .await
 }
 
-pub async fn new_db(uri: ScyllaDbUri, node_state: Sender<NodeState>) -> anyhow::Result<Sender<Db>> {
-    db::new(uri, node_state).await
+pub async fn new_db(
+    uri: ScyllaDbUri,
+    node_state: Sender<NodeState>,
+    credentials: Option<Credentials>,
+) -> anyhow::Result<Sender<Db>> {
+    db::new(uri, node_state, credentials).await
 }
 
 pub async fn new_node_state() -> Sender<NodeState> {

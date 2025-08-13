@@ -5,6 +5,7 @@
 
 use crate::ColumnName;
 use crate::Connectivity;
+use crate::Credentials;
 use crate::DbCustomIndex;
 use crate::DbEmbedding;
 use crate::Dimensions;
@@ -207,16 +208,17 @@ impl DbExt for mpsc::Sender<Db> {
 pub(crate) async fn new(
     uri: ScyllaDbUri,
     node_state: Sender<NodeState>,
+    credentials: Option<Credentials>,
 ) -> anyhow::Result<mpsc::Sender<Db>> {
     let (tx, mut rx) = mpsc::channel(10);
     tokio::spawn(
         async move {
             node_state.send_event(Event::ConnectingToDb).await;
-            let mut statements = Statements::new(uri.clone()).await;
+            let mut statements = Statements::new(uri.clone(), credentials.clone()).await;
             while statements.is_err() {
                 tracing::error!("Failed to create statements, retrying");
                 sleep(Duration::from_secs(1)).await;
-                statements = Statements::new(uri.clone()).await;
+                statements = Statements::new(uri.clone(), credentials.clone()).await;
             }
             node_state.send_event(Event::ConnectedToDb).await;
             let statements = Arc::new(statements.unwrap());
@@ -291,13 +293,13 @@ struct Statements {
 }
 
 impl Statements {
-    async fn new(uri: ScyllaDbUri) -> anyhow::Result<Self> {
-        let session = Arc::new(
-            SessionBuilder::new()
-                .known_node(uri.0.as_str())
-                .build()
-                .await?,
-        );
+    async fn new(uri: ScyllaDbUri, credentials: Option<Credentials>) -> anyhow::Result<Self> {
+        let mut builder = SessionBuilder::new().known_node(uri.0.as_str());
+        if let Some(Credentials { username, password }) = credentials {
+            builder = builder.user(username, password);
+        }
+
+        let session = Arc::new(builder.build().await?);
         Ok(Self {
             st_latest_schema_version: session
                 .prepare(Self::ST_LATEST_SCHEMA_VERSION)

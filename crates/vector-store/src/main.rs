@@ -4,6 +4,7 @@
  */
 
 use anyhow::anyhow;
+use anyhow::bail;
 use clap::Parser;
 use std::net::ToSocketAddrs;
 use tracing_subscriber::EnvFilter;
@@ -14,6 +15,28 @@ mod info;
 #[derive(Parser)]
 #[clap(version)]
 struct Args {}
+
+async fn credentials<F>(env: F) -> anyhow::Result<Option<vector_store::Credentials>>
+where
+    F: Fn(&'static str) -> Result<String, std::env::VarError>,
+{
+    let Ok(username) = env("VECTOR_STORE_SCYLLADB_USERNAME") else {
+        return Ok(None);
+    };
+    let Ok(password_file) = env("VECTOR_STORE_SCYLLADB_PASSWORD_FILE") else {
+        bail!(
+            "credentials: VECTOR_STORE_SCYLLADB_PASSWORD_FILE env required when VECTOR_STORE_SCYLLADB_USERNAME is set"
+        );
+    };
+    let password = tokio::fs::read_to_string(&password_file)
+        .await
+        .map_err(|e| anyhow!("credentials: failed to read password file: {}", e))?;
+
+    Ok(Some(vector_store::Credentials {
+        username,
+        password: password.trim().to_string(),
+    }))
+}
 
 // Index creating/querying is CPU bound task, so that vector-store uses rayon ThreadPool for them.
 // From the start there was no need (network traffic seems to be not so high) to support more than
@@ -61,7 +84,12 @@ async fn main() -> anyhow::Result<()> {
         vector_store::new_index_factory_usearch()?
     };
 
-    let db_actor = vector_store::new_db(scylladb_uri, node_state.clone()).await?;
+    let db_actor = vector_store::new_db(
+        scylladb_uri,
+        node_state.clone(),
+        credentials(std::env::var).await?,
+    )
+    .await?;
 
     let (_server_actor, addr) = vector_store::run(
         vector_store_addr,
@@ -76,4 +104,94 @@ async fn main() -> anyhow::Result<()> {
     vector_store::wait_for_shutdown().await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn mock_env(
+        vars: HashMap<&'static str, String>,
+    ) -> impl Fn(&'static str) -> Result<String, std::env::VarError> {
+        move |key| vars.get(key).cloned().ok_or(std::env::VarError::NotPresent)
+    }
+
+    #[tokio::test]
+    async fn credentials_none_when_no_username() {
+        let env = mock_env(HashMap::new());
+
+        let creds = credentials(env).await.unwrap();
+
+        assert!(creds.is_none());
+    }
+
+    #[tokio::test]
+    async fn credentials_error_when_no_password_file_env() {
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_SCYLLADB_USERNAME",
+            "user".into(),
+        )]));
+
+        let result = credentials(env).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "credentials: VECTOR_STORE_SCYLLADB_PASSWORD_FILE env required when VECTOR_STORE_SCYLLADB_USERNAME is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn credentials_error_when_password_file_not_found() {
+        let env = mock_env(HashMap::from([
+            ("VECTOR_STORE_SCYLLADB_USERNAME", "user".into()),
+            (
+                "VECTOR_STORE_SCYLLADB_PASSWORD_FILE",
+                "/no/such/file/exists".into(),
+            ),
+        ]));
+
+        let result = credentials(env).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn credentials_success() {
+        let mut password_file = NamedTempFile::new().unwrap();
+        writeln!(password_file, "my_secret_pass").unwrap();
+        let env = mock_env(HashMap::from([
+            ("VECTOR_STORE_SCYLLADB_USERNAME", "test_user".into()),
+            (
+                "VECTOR_STORE_SCYLLADB_PASSWORD_FILE",
+                password_file.path().to_str().unwrap().into(),
+            ),
+        ]));
+
+        let creds = credentials(env).await.unwrap().unwrap();
+
+        assert_eq!(creds.username, "test_user");
+        assert_eq!(creds.password, "my_secret_pass");
+    }
+
+    #[tokio::test]
+    async fn credentials_success_with_trimmed_password() {
+        let mut password_file = NamedTempFile::new().unwrap();
+        writeln!(password_file, "  \n my_trimmed_pass \t\n").unwrap();
+        let env = mock_env(HashMap::from([
+            ("VECTOR_STORE_SCYLLADB_USERNAME", "trim_user".into()),
+            (
+                "VECTOR_STORE_SCYLLADB_PASSWORD_FILE",
+                password_file.path().to_str().unwrap().into(),
+            ),
+        ]));
+
+        let creds = credentials(env).await.unwrap().unwrap();
+
+        assert_eq!(creds.username, "trim_user");
+        assert_eq!(creds.password, "my_trimmed_pass");
+    }
 }
