@@ -32,6 +32,7 @@ for i in {1..10}; do
     ip addr add $base_ip.\$i/32 dev lo
 done
 cat /etc/resolv.conf
+#$validator --scylla-default-conf /home/karolnowacki/Projects/Scylla/scylladb/conf/scylla.yaml  --dns-ip $dns_ip --base-ip $base_ip.1 $scylla $vector_store $@ ann_query_with_clustering_key
 $validator --dns-ip $dns_ip --base-ip $base_ip.1 $scylla $vector_store $@
 EOF
 

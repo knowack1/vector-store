@@ -34,6 +34,7 @@ pub(crate) async fn new() -> TestCase {
             timeout,
             ann_query_returns_rows_identified_by_composite_primary_key,
         )
+        .with_test("test_vector_regression", timeout, test_vector_regression)
 }
 
 async fn ann_query_returns_expected_results(actors: TestActors) {
@@ -307,4 +308,28 @@ async fn ann_query_returns_rows_identified_by_composite_primary_key(actors: Test
         .expect("failed to drop a keyspace");
 
     info!("finished");
+}
+
+async fn test_vector_regression(actors: TestActors) {
+    info!("started");
+
+    let (session, _) = prepare_connection(&actors).await;
+    let keyspace = "ks";
+
+    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {keyspace} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}"), ()).await.unwrap();
+
+    let table_name = "test_vector";
+
+    let create_statement = format!(
+        "CREATE TABLE {}.{} (a int PRIMARY KEY, b vector<set<int>, 1>)",
+        keyspace, table_name,
+    );
+    session.query_unpaged(create_statement, ()).await.unwrap();
+
+    let q = format!("INSERT INTO {keyspace}.{table_name} (a, b) VALUES (?, ?)");
+
+    session
+        .query_unpaged(q.clone(), (1, vec![HashSet::from([42])]))
+        .await
+        .unwrap();
 }
