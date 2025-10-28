@@ -249,7 +249,9 @@ async fn run_cluster(
             .arg("--developer-mode")
             .arg("true")
             .arg("--smp")
-            .arg("2")
+            .arg("1")
+            .arg("--default-log-level")
+            .arg("trace")
             .spawn()
             .expect("start: failed to spawn scylladb"),
     );

@@ -74,7 +74,7 @@ pub(crate) async fn cleanup(actors: TestActors) {
 pub(crate) async fn prepare_connection(actors: &TestActors) -> (Arc<Session>, HttpClient) {
     let session = Arc::new(
         SessionBuilder::new()
-            .known_node(actors.services_subnet.ip(DB_OCTET).to_string())
+            .known_node("127.0.0.1:9042")
             .build()
             .await
             .expect("failed to create session"),

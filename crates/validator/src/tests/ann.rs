@@ -12,8 +12,8 @@ use tracing::info;
 pub(crate) async fn new() -> TestCase {
     let timeout = Duration::from_secs(30);
     TestCase::empty()
-        .with_init(timeout, init)
-        .with_cleanup(timeout, cleanup)
+        // .with_init(timeout, init)
+        // .with_cleanup(timeout, cleanup)
         .with_test(
             "ann_query_returns_expected_results",
             timeout,
@@ -314,22 +314,31 @@ async fn test_vector_regression(actors: TestActors) {
     info!("started");
 
     let (session, _) = prepare_connection(&actors).await;
+    info!("Connection prepared");
     let keyspace = "ks";
 
+    info!("Creating keyspace: {}", keyspace);
     session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {keyspace} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}"), ()).await.unwrap();
+    info!("Keyspace created");
 
     let table_name = "test_vector";
 
     let create_statement = format!(
-        "CREATE TABLE {}.{} (a int PRIMARY KEY, b vector<set<int>, 1>)",
+        "CREATE TABLE IF NOT EXISTS {}.{} (a int PRIMARY KEY, b vector<set<int>, 1>) WITH tablets = {{'enabled': false}}",
         keyspace, table_name,
     );
+    info!("Creating table: {}", create_statement);
     session.query_unpaged(create_statement, ()).await.unwrap();
+    info!("Table created");
 
     let q = format!("INSERT INTO {keyspace}.{table_name} (a, b) VALUES (?, ?)");
+    info!("Inserting data: {}", q);
 
     session
         .query_unpaged(q.clone(), (1, vec![HashSet::from([42])]))
         .await
         .unwrap();
+    info!("Data inserted");
+
+    info!("finished");
 }
