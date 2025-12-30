@@ -50,6 +50,7 @@ use usearch::ScalarKind;
 pub struct UsearchIndexFactory {
     tokio_semaphore: Arc<Semaphore>,
     rayon_semaphore: Arc<Semaphore>,
+    index_concurrency: usize,
     mode: Mode,
 }
 
@@ -80,6 +81,7 @@ impl IndexFactory for UsearchIndexFactory {
                     Arc::clone(&self.tokio_semaphore),
                     Arc::clone(&self.rayon_semaphore),
                     memory,
+                    self.index_concurrency,
                 )
             }
             Mode::Simulator { config, config_rx } => {
@@ -91,6 +93,7 @@ impl IndexFactory for UsearchIndexFactory {
                     Arc::clone(&self.tokio_semaphore),
                     Arc::clone(&self.rayon_semaphore),
                     memory,
+                    self.index_concurrency,
                 )
             }
         }
@@ -107,12 +110,14 @@ impl IndexFactory for UsearchIndexFactory {
 pub fn new_usearch(
     tokio_semaphore: Arc<Semaphore>,
     rayon_semaphore: Arc<Semaphore>,
+    index_concurrency: usize,
     mut config_rx: watch::Receiver<Arc<Config>>,
 ) -> anyhow::Result<UsearchIndexFactory> {
     let config = config_rx.borrow_and_update().clone();
     Ok(UsearchIndexFactory {
         tokio_semaphore,
         rayon_semaphore,
+        index_concurrency,
         mode: if config.usearch_simulator.is_none() {
             Mode::Usearch
         } else {
@@ -429,6 +434,7 @@ fn new<I: UsearchIndex + Send + Sync + 'static>(
     tokio_semaphore: Arc<Semaphore>,
     rayon_semaphore: Arc<Semaphore>,
     memory: mpsc::Sender<Memory>,
+    index_concurrency: usize,
 ) -> anyhow::Result<mpsc::Sender<Index>> {
     idx.reserve(RESERVE_INCREMENT)?;
 
@@ -441,11 +447,10 @@ fn new<I: UsearchIndex + Send + Sync + 'static>(
             let id = id.clone();
             async move {
                 debug!("starting");
-
-                let idx = Arc::new(TokioRwLock::new(IndexState::new(
-                    Arc::clone(&idx),
-                    dimensions,
-                )));
+                let idx = Arc::new(TokioRwLock::with_max_readers(
+                    IndexState::new(Arc::clone(&idx), dimensions),
+                    index_concurrency as u32,
+                ));
 
                 let mut allocate_prev = Allocate::Can;
 
@@ -776,6 +781,7 @@ mod tests {
         let factory = UsearchIndexFactory {
             tokio_semaphore: Arc::new(Semaphore::new(4)),
             rayon_semaphore: Arc::new(Semaphore::new(4)),
+            index_concurrency: Semaphore::MAX_PERMITS,
             mode: Mode::Usearch,
         };
         let actor = factory
@@ -900,6 +906,7 @@ mod tests {
         let factory = UsearchIndexFactory {
             tokio_semaphore: Arc::new(Semaphore::new(4)),
             rayon_semaphore: Arc::new(Semaphore::new(4)),
+            index_concurrency: Semaphore::MAX_PERMITS,
             mode: Mode::Usearch,
         };
         let actor = factory
@@ -957,6 +964,7 @@ mod tests {
         let factory = UsearchIndexFactory {
             tokio_semaphore: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             rayon_semaphore: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+            index_concurrency: Semaphore::MAX_PERMITS,
             mode: Mode::Usearch,
         };
         let index = factory

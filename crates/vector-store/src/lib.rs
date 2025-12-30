@@ -573,10 +573,15 @@ pub fn new_index_factory_usearch(
     // The limit is set to 3 times the number of Rayon threads to ensure high throughput.
     let add_remove_concurrency = rayon::current_num_threads() * 3;
     let rayon_semaphore = Arc::new(Semaphore::new(add_remove_concurrency));
+    // Concurrency limit for a single index.
+    // Concurrent add/remove/search operations on a single index are limited by the global `add_remove_concurrency`.
+    // This prevents a single, busy index from exhausting both global add/remove and search concurrency.
+    let index_concurrency = add_remove_concurrency;
 
     Ok(Box::new(index::usearch::new_usearch(
         tokio_semaphore,
         rayon_semaphore,
+        index_concurrency,
         config_tx,
     )?))
 }
