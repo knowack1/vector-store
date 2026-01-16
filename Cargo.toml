@@ -41,7 +41,7 @@ rand = "0.9.2"
 regex = "1.11.1"
 reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls"] }
 scylla = { version = "1.2.0", features = ["time-03", "rustls-023"] }
-scylla-cdc = "0.5.0"
+scylla-cdc = { git = "https://github.com/adespawn/scylla-cdc-rust", rev = "bbdafb6be1ac4510676054e921e7356e2dd1b7ca" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 syn = { version = "2.0", features = ["full"] }
