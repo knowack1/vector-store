@@ -13,13 +13,12 @@ trait F32ToB1x8Iterator<'a>: Iterator<Item = &'a f32> + Sized {
             .chunks(8)
             .into_iter()
             .map(|chunk| {
-                chunk.enumerate().fold(0u8, |byte, (i, &val)| {
-                    if val > 0.0 {
-                        byte | (1 << i)
-                    } else {
-                        byte
-                    }
-                })
+                chunk.enumerate().fold(
+                    0u8,
+                    |byte, (i, &val)| {
+                        if val > 0.0 { byte | (1 << i) } else { byte }
+                    },
+                )
             })
             .collect();
 
@@ -37,35 +36,50 @@ fn f32_to_b1x8_2(f32_vec: &[f32]) -> Vec<b1x8> {
     let bytes: Vec<u8> = f32_vec
         .chunks_exact(8)
         .map(|chunk| {
-            chunk.iter().enumerate().fold(0u8, |byte, (i, &val)| {
-                if val > 0.0 {
-                    byte | (1 << i)
-                } else {
-                    byte
-                }
-            })
+            chunk.iter().enumerate().fold(
+                0u8,
+                |byte, (i, &val)| {
+                    if val > 0.0 { byte | (1 << i) } else { byte }
+                },
+            )
         })
         .collect();
 
     b1x8::from_u8s(&bytes).to_vec()
 }
 
-fn f32_to_b1x8_3(data: &[f32]) -> Vec<b1x8> {
-    let bytes: Vec<u8> = data
-        .chunks_exact(8)
+fn f32_to_b1x8_3(f32_vec: &[f32]) -> Vec<b1x8> {
+    let bytes: Vec<u8> = f32_vec
+        .chunks(8)
         .map(|chunk| {
-            let mut byte = 0u8;
-            for (i, &val) in chunk.iter().enumerate() {
-                if val > 0.0 {
-                    byte |= 1 << i;
-                }
-            }
-            byte
+            chunk.iter().enumerate().fold(
+                0u8,
+                |byte, (i, &val)| {
+                    if val > 0.0 { byte | (1 << i) } else { byte }
+                },
+            )
         })
         .collect();
 
     b1x8::from_u8s(&bytes).to_vec()
 }
+
+// fn f32_to_b1x8_3(data: &[f32]) -> Vec<b1x8> {
+//     let bytes: Vec<u8> = data
+//         .chunks_exact(8)
+//         .map(|chunk| {
+//             let mut byte = 0u8;
+//             for (i, &val) in chunk.iter().enumerate() {
+//                 if val > 0.0 {
+//                     byte |= 1 << i;
+//                 }
+//             }
+//             byte
+//         })
+//         .collect();
+
+//     b1x8::from_u8s(&bytes).to_vec()
+// }
 
 fn f32_to_b1x8_4(f32_vec: &[f32]) -> Vec<b1x8> {
     let mut bytes = vec![0u8; (f32_vec.len() + 7) / 8];
@@ -83,13 +97,12 @@ trait SliceChunksToB1x8<'a>: Iterator<Item = &'a [f32]> + Sized {
     fn to_b1x8(self) -> Vec<b1x8> {
         let bytes: Vec<u8> = self
             .map(|chunk| {
-                chunk.iter().enumerate().fold(0u8, |byte, (i, &val)| {
-                    if val > 0.0 {
-                        byte | (1 << i)
-                    } else {
-                        byte
-                    }
-                })
+                chunk.iter().enumerate().fold(
+                    0u8,
+                    |byte, (i, &val)| {
+                        if val > 0.0 { byte | (1 << i) } else { byte }
+                    },
+                )
             })
             .collect();
 
@@ -192,10 +205,10 @@ fn main() {
     println!();
 
     let sizes = vec![
-        ("Small (1KB)", 256),           // 256 * 4 bytes = 1KB
-        ("Medium (128KB)", 32_768),     // 32KB * 4 = 128KB
-        ("Large (1MB)", 262_144),       // 256KB * 4 = 1MB
-        ("XLarge (16MB)", 4_194_304),   // 4M * 4 = 16MB
+        ("Small (1KB)", 256),         // 256 * 4 bytes = 1KB
+        ("Medium (128KB)", 32_768),   // 32KB * 4 = 128KB
+        ("Large (1MB)", 262_144),     // 256KB * 4 = 1MB
+        ("XLarge (16MB)", 4_194_304), // 4M * 4 = 16MB
     ];
 
     for (label, size) in sizes {
@@ -233,8 +246,6 @@ fn main() {
     }
 }
 
-
-// Results on my machine:
 // === F32 to B1x8 Conversion Benchmark ===
 
 // Verifying correctness...
@@ -242,65 +253,65 @@ fn main() {
 // ✓ Correctness verified for size 131072
 
 // === Small (1KB) (256 elements, 1024 bytes) ===
-// v1: iter+chunks      | Total:     16.116ms | Avg:    1.611μs | Throughput:     635.39 MB/s
-// v2: chunks_exact+fold | Total:      0.027ms | Avg:    0.002μs | Throughput:  380019.30 MB/s
-// v3: chunks_exact+for | Total:      0.031ms | Avg:    0.003μs | Throughput:  327104.30 MB/s
-// v4: preallocate+index | Total:      3.047ms | Avg:    0.304μs | Throughput:    3360.95 MB/s
-// v5: chunks_exact+trait | Total:      2.740ms | Avg:    0.274μs | Throughput:    3736.74 MB/s
+// v1: iter+chunks      | Total:     20.163ms | Avg:    2.016μs | Throughput:     507.86 MB/s
+// v2: chunks_exact+fold | Total:      0.032ms | Avg:    0.003μs | Throughput:  321810.18 MB/s
+// v3: chunks_exact+for | Total:      1.370ms | Avg:    0.136μs | Throughput:    7475.24 MB/s
+// v4: preallocate+index | Total:      3.503ms | Avg:    0.350μs | Throughput:    2923.21 MB/s
+// v5: chunks_exact+trait | Total:      3.248ms | Avg:    0.324μs | Throughput:    3152.61 MB/s
 
 // Relative performance (vs fastest):
-//   v1: 598.09x
+//   v1: 633.66x
 //   v2: 1.00x
-//   v3: 1.16x
-//   v4: 113.07x
-//   v5: 101.70x
+//   v3: 43.05x
+//   v4: 110.09x
+//   v5: 102.08x
 
 // ================================================================================
 
 // === Medium (128KB) (32768 elements, 131072 bytes) ===
-// v1: iter+chunks      | Total:    214.158ms | Avg:  214.157μs | Throughput:     612.03 MB/s
-// v2: chunks_exact+fold | Total:      0.003ms | Avg:    0.002μs | Throughput: 45621997.91 MB/s
-// v3: chunks_exact+for | Total:      0.003ms | Avg:    0.002μs | Throughput: 45463753.04 MB/s
-// v4: preallocate+index | Total:     36.946ms | Avg:   36.946μs | Throughput:    3547.64 MB/s
-// v5: chunks_exact+trait | Total:     30.329ms | Avg:   30.329μs | Throughput:    4321.67 MB/s
+// v1: iter+chunks      | Total:    193.518ms | Avg:  193.517μs | Throughput:     677.31 MB/s
+// v2: chunks_exact+fold | Total:      0.003ms | Avg:    0.003μs | Throughput: 41835939.99 MB/s
+// v3: chunks_exact+for | Total:     10.240ms | Avg:   10.239μs | Throughput:   12800.18 MB/s
+// v4: preallocate+index | Total:     32.084ms | Avg:   32.083μs | Throughput:    4085.30 MB/s
+// v5: chunks_exact+trait | Total:     25.167ms | Avg:   25.166μs | Throughput:    5208.11 MB/s
 
 // Relative performance (vs fastest):
-//   v1: 74541.54x
+//   v1: 61767.50x
 //   v2: 1.00x
-//   v3: 1.00x
-//   v4: 12859.81x
-//   v5: 10556.57x
+//   v3: 3268.39x
+//   v4: 10240.61x
+//   v5: 8032.84x
 
 // ================================================================================
 
 // === Large (1MB) (262144 elements, 1048576 bytes) ===
-// v1: iter+chunks      | Total:    154.717ms | Avg: 1547.167μs | Throughput:     677.74 MB/s
-// v2: chunks_exact+fold | Total:      0.000ms | Avg:    0.003μs | Throughput: 264124937.03 MB/s
-// v3: chunks_exact+for | Total:      0.000ms | Avg:    0.003μs | Throughput: 294543820.22 MB/s
-// v4: preallocate+index | Total:     28.736ms | Avg:  287.363μs | Throughput:    3648.95 MB/s
-// v5: chunks_exact+trait | Total:     25.783ms | Avg:  257.827μs | Throughput:    4066.97 MB/s
+// v1: iter+chunks      | Total:    125.194ms | Avg: 1251.939μs | Throughput:     837.56 MB/s
+// v2: chunks_exact+fold | Total:      0.000ms | Avg:    0.003μs | Throughput: 312076190.48 MB/s
+// v3: chunks_exact+for | Total:      6.673ms | Avg:   66.731μs | Throughput:   15713.31 MB/s
+// v4: preallocate+index | Total:     24.333ms | Avg:  243.330μs | Throughput:    4309.27 MB/s
+// v5: chunks_exact+trait | Total:     20.268ms | Avg:  202.678μs | Throughput:    5173.60 MB/s
 
 // Relative performance (vs fastest):
-//   v1: 434597.59x
-//   v2: 1.12x
-//   v3: 1.00x
-//   v4: 80720.06x
-//   v5: 72423.35x
+//   v1: 372601.06x
+//   v2: 1.00x
+//   v3: 19860.62x
+//   v4: 72419.70x
+//   v5: 60320.95x
 
 // ================================================================================
 
 // === XLarge (16MB) (4194304 elements, 16777216 bytes) ===
-// v1: iter+chunks      | Total:    251.293ms | Avg: 25129.325μs | Throughput:     667.63 MB/s
-// v2: chunks_exact+fold | Total:      0.000ms | Avg:    0.011μs | Throughput: 1446311724.14 MB/s
-// v3: chunks_exact+for | Total:      0.000ms | Avg:    0.013μs | Throughput: 1261444812.03 MB/s
-// v4: preallocate+index | Total:     51.617ms | Avg: 5161.650μs | Throughput:    3250.36 MB/s
-// v5: chunks_exact+trait | Total:     49.011ms | Avg: 4901.145μs | Throughput:    3423.12 MB/s
+// v1: iter+chunks      | Total:    200.086ms | Avg: 20008.640μs | Throughput:     838.50 MB/s
+// v2: chunks_exact+fold | Total:      0.000ms | Avg:    0.011μs | Throughput: 1421797966.10 MB/s
+// v3: chunks_exact+for | Total:     13.207ms | Avg: 1320.674μs | Throughput:   12703.52 MB/s
+// v4: preallocate+index | Total:     42.770ms | Avg: 4277.047μs | Throughput:    3922.62 MB/s
+// v5: chunks_exact+trait | Total:     42.757ms | Avg: 4275.705μs | Throughput:    3923.85 MB/s
 
 // Relative performance (vs fastest):
-//   v1: 2166321.19x
+//   v1: 1695647.46x
 //   v2: 1.00x
-//   v3: 1.15x
-//   v4: 444969.88x
-//   v5: 422512.50x
+//   v3: 111921.59x
+//   v4: 362461.62x
+//   v5: 362347.92x
 
 // ================================================================================
