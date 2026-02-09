@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+use std::sync::Arc;
+
 use crate::AsyncInProgress;
 use crate::Distance;
 use crate::Filter;
@@ -17,7 +19,7 @@ pub(crate) type CountR = anyhow::Result<usize>;
 
 pub enum Index {
     Add {
-        primary_key: PrimaryKey,
+        primary_key: Arc<PrimaryKey>,
         embedding: Vector,
         in_progress: Option<AsyncInProgress>,
     },
@@ -44,7 +46,7 @@ pub enum Index {
 pub(crate) trait IndexExt {
     async fn add(
         &self,
-        primary_key: PrimaryKey,
+        primary_key: Arc<PrimaryKey>,
         embedding: Vector,
         in_progress: Option<AsyncInProgress>,
     );
@@ -57,7 +59,7 @@ pub(crate) trait IndexExt {
 impl IndexExt for mpsc::Sender<Index> {
     async fn add(
         &self,
-        primary_key: PrimaryKey,
+        primary_key: Arc<PrimaryKey>,
         embedding: Vector,
         in_progress: Option<AsyncInProgress>,
     ) {
