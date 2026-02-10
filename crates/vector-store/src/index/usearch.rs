@@ -12,6 +12,7 @@ use crate::IndexFactory;
 use crate::IndexId;
 use crate::Limit;
 use crate::PrimaryKey;
+use crate::PrimaryKeySmall;
 use crate::Quantization;
 use crate::Restriction;
 use crate::SpaceType;
@@ -35,6 +36,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use std::usize::MAX;
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
@@ -65,43 +67,53 @@ impl IndexFactory for UsearchIndexFactory {
         primary_key_columns: Arc<Vec<ColumnName>>,
         memory: mpsc::Sender<Memory>,
     ) -> anyhow::Result<mpsc::Sender<Index>> {
-        match &self.mode {
-            Mode::Usearch => {
-                let options = IndexOptions {
-                    dimensions: index.dimensions.0.get(),
-                    connectivity: index.connectivity.0,
-                    expansion_add: index.expansion_add.0,
-                    expansion_search: index.expansion_search.0,
-                    metric: metric_kind(index.quantization, index.space_type),
-                    quantization: index.quantization.into(),
-                    ..Default::default()
-                };
-                let threads =
-                    Handle::current().metrics().num_workers() + rayon::current_num_threads();
-                let idx = Arc::new(ThreadedUsearchIndex::new(options, threads)?);
-                new(
-                    idx,
-                    index.id,
-                    index.dimensions,
-                    primary_key_columns,
-                    Arc::clone(&self.tokio_semaphore),
-                    Arc::clone(&self.rayon_semaphore),
-                    memory,
-                )
-            }
-            Mode::Simulator { config, config_rx } => {
-                let sim = Simulator::new(config.clone(), config_rx.clone(), index.id.clone());
-                new(
-                    sim,
-                    index.id,
-                    index.dimensions,
-                    primary_key_columns,
-                    Arc::clone(&self.tokio_semaphore),
-                    Arc::clone(&self.rayon_semaphore),
-                    memory,
-                )
-            }
-        }
+        let sim = Simulator::new(index.id.clone());
+        new(
+            sim,
+            index.id,
+            index.dimensions,
+            primary_key_columns,
+            Arc::clone(&self.tokio_semaphore),
+            Arc::clone(&self.rayon_semaphore),
+            memory,
+        )
+        // match &self.mode {
+        //     Mode::Usearch => {
+        //         let options = IndexOptions {
+        //             dimensions: index.dimensions.0.get(),
+        //             connectivity: index.connectivity.0,
+        //             expansion_add: index.expansion_add.0,
+        //             expansion_search: index.expansion_search.0,
+        //             metric: metric_kind(index.quantization, index.space_type),
+        //             quantization: index.quantization.into(),
+        //             ..Default::default()
+        //         };
+        //         let threads =
+        //             Handle::current().metrics().num_workers() + rayon::current_num_threads();
+        //         let idx = Arc::new(ThreadedUsearchIndex::new(options, threads)?);
+        //         new(
+        //             idx,
+        //             index.id,
+        //             index.dimensions,
+        //             primary_key_columns,
+        //             Arc::clone(&self.tokio_semaphore),
+        //             Arc::clone(&self.rayon_semaphore),
+        //             memory,
+        //         )
+        //     }
+        //     Mode::Simulator { config, config_rx } => {
+        //         let sim = Simulator::new(config.clone(), config_rx.clone(), index.id.clone());
+        //         new(
+        //             sim,
+        //             index.id,
+        //             index.dimensions,
+        //             primary_key_columns,
+        //             Arc::clone(&self.tokio_semaphore),
+        //             Arc::clone(&self.rayon_semaphore),
+        //             memory,
+        //         )
+        //     }
+        // }
     }
 
     fn index_engine_version(&self) -> String {
@@ -257,11 +269,7 @@ impl Simulator {
     const ADD_REMOVE_IDX: usize = 1;
     const RESERVE_IDX: usize = 2;
 
-    fn new(
-        config: Arc<Config>,
-        mut config_rx: watch::Receiver<Arc<Config>>,
-        id: IndexId,
-    ) -> Arc<RwLock<Self>> {
+    fn new(id: IndexId) -> Arc<RwLock<Self>> {
         let mut sim = Self {
             config: Arc::new(Config::default()),
             search: Duration::ZERO,
@@ -270,29 +278,29 @@ impl Simulator {
             keys: RwLock::new(HashSet::new()),
             notify: Arc::new(Notify::new()),
         };
-        sim.update(config);
+        // sim.update(config);
         let notify = Arc::clone(&sim.notify);
         let sim = Arc::new(RwLock::new(sim));
 
-        tokio::spawn(
-            {
-                let sim = Arc::clone(&sim);
-                async move {
-                    loop {
-                        tokio::select! {
-                            _ = config_rx.changed() => {
-                                let config = config_rx.borrow_and_update().clone();
-                                sim.write().unwrap().update(config);
-                            }
-                            _ = notify.notified() => {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            .instrument(debug_span!("simulator", "{}", id)),
-        );
+        // tokio::spawn(
+        //     {
+        //         let sim = Arc::clone(&sim);
+        //         async move {
+        //             loop {
+        //                 tokio::select! {
+        //                     _ = config_rx.changed() => {
+        //                         let config = config_rx.borrow_and_update().clone();
+        //                         sim.write().unwrap().update(config);
+        //                     }
+        //                     _ = notify.notified() => {
+        //                         break;
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //     }
+        //     .instrument(debug_span!("simulator", "{}", id)),
+        // );
 
         sim
     }
@@ -342,23 +350,24 @@ impl Simulator {
 
 impl UsearchIndex for RwLock<Simulator> {
     fn reserve(&self, size: usize) -> anyhow::Result<()> {
-        let start = Instant::now();
+        // let start = Instant::now();
 
-        // we need simulate write lock similar to real usearch index
-        #[allow(clippy::readonly_write_lock)]
-        let sim = self.write().unwrap();
-        {
-            let mut keys = sim.keys.write().unwrap();
-            let len = keys.len();
-            keys.reserve(size - len);
-        }
+        // // we need simulate write lock similar to real usearch index
+        // #[allow(clippy::readonly_write_lock)]
+        // let sim = self.write().unwrap();
+        // {
+        //     let mut keys = sim.keys.write().unwrap();
+        //     let len = keys.len();
+        //     keys.reserve(size - len);
+        // }
 
-        sim.wait_reserve(start);
+        // sim.wait_reserve(start);
         Ok(())
     }
 
     fn capacity(&self) -> usize {
-        self.read().unwrap().keys.read().unwrap().capacity()
+        // self.read().unwrap().keys.read().unwrap().capacity()
+        MAX
     }
 
     fn size(&self) -> usize {
@@ -366,22 +375,22 @@ impl UsearchIndex for RwLock<Simulator> {
     }
 
     fn add(&self, key: Key, _: &Vector) -> anyhow::Result<()> {
-        let start = Instant::now();
+        // let start = Instant::now();
 
-        let sim = self.read().unwrap();
-        sim.keys.write().unwrap().insert(key);
+        // let sim = self.read().unwrap();
+        // sim.keys.write().unwrap().insert(key);
 
-        sim.wait_add_remove(start);
+        // sim.wait_add_remove(start);
         Ok(())
     }
 
     fn remove(&self, key: Key) -> anyhow::Result<()> {
-        let start = Instant::now();
+        // let start = Instant::now();
 
-        let sim = self.read().unwrap();
-        sim.keys.write().unwrap().remove(&key);
+        // let sim = self.read().unwrap();
+        // sim.keys.write().unwrap().remove(&key);
 
-        sim.wait_add_remove(start);
+        // sim.wait_add_remove(start);
         Ok(())
     }
 
@@ -603,7 +612,7 @@ mod operation {
 
 struct IndexState<I: UsearchIndex + Send + Sync + 'static> {
     idx: Arc<I>,
-    keys: RwLock<BiMap<Arc<PrimaryKey>, Key>>,
+    keys: RwLock<BiMap<Arc<PrimaryKeySmall>, Key>>,
     dimensions: Dimensions,
     usearch_key: AtomicU64,
 }
@@ -791,7 +800,7 @@ fn reserve(idx: &impl UsearchIndex, capacity: usize) {
 
 fn needs_more_capacity(
     idx: &impl UsearchIndex,
-    keys: &RwLock<BiMap<Arc<PrimaryKey>, Key>>,
+    keys: &RwLock<BiMap<Arc<PrimaryKeySmall>, Key>>,
 ) -> Option<usize> {
     let capacity = idx.capacity();
     let free_space = capacity - keys.read().unwrap().len();
@@ -805,9 +814,9 @@ fn needs_more_capacity(
 
 fn add(
     idx: &impl UsearchIndex,
-    keys: &RwLock<BiMap<Arc<PrimaryKey>, Key>>,
+    keys: &RwLock<BiMap<Arc<PrimaryKeySmall>, Key>>,
     usearch_key: &AtomicU64,
-    primary_key: Arc<PrimaryKey>,
+    primary_key: Arc<PrimaryKeySmall>,
     embedding: Vector,
 ) {
     let key = usearch_key.fetch_add(1, Ordering::Relaxed).into();
@@ -815,13 +824,13 @@ fn add(
         debug!("add: unable to add embedding for key {key}: {err}");
         return;
     };
-    let _ = keys.write().unwrap().insert(primary_key, key);
+    let _ = keys.write().unwrap().insert(primary_key.into(), key);
 }
 
 fn remove(
     idx: &impl UsearchIndex,
-    keys: &RwLock<BiMap<Arc<PrimaryKey>, Key>>,
-    primary_key: PrimaryKey,
+    keys: &RwLock<BiMap<Arc<PrimaryKeySmall>, Key>>,
+    primary_key: PrimaryKeySmall,
 ) {
     let Some((_, key)) = keys.write().unwrap().remove_by_left(&primary_key) else {
         return;
@@ -850,29 +859,29 @@ fn validate_dimensions(
 fn ann(
     idx: Arc<impl UsearchIndex>,
     tx_ann: oneshot::Sender<AnnR>,
-    keys: &RwLock<BiMap<Arc<PrimaryKey>, Key>>,
+    keys: &RwLock<BiMap<Arc<PrimaryKeySmall>, Key>>,
     embedding: Vector,
     limit: Limit,
 ) {
-    tx_ann
-        .send(
-            idx.search(&embedding, limit)
-                .map_err(|err| anyhow!("ann: search failed: {err}"))
-                .and_then(|matches| {
-                    let keys = keys.read().unwrap();
-                    let (primary_keys, distances) = itertools::process_results(
-                        matches.map(|(key, distance)| {
-                            keys.get_by_right(&key)
-                                .cloned()
-                                .ok_or(anyhow!("not defined primary key column {key}"))
-                                .map(|primary_key| ((*primary_key).clone(), distance))
-                        }),
-                        |it| it.unzip(),
-                    )?;
-                    Ok((primary_keys, distances))
-                }),
-        )
-        .unwrap_or_else(|_| trace!("ann: unable to send response"));
+    // tx_ann
+    //     .send(
+    //         idx.search(&embedding, limit)
+    //             .map_err(|err| anyhow!("ann: search failed: {err}"))
+    //             .and_then(|matches| {
+    //                 let keys = keys.read().unwrap();
+    //                 let (primary_keys, distances) = itertools::process_results(
+    //                     matches.map(|(key, distance)| {
+    //                         keys.get_by_right(&key)
+    //                             .cloned()
+    //                             .ok_or(anyhow!("not defined primary key column {key}"))
+    //                             .map(|primary_key| ((*primary_key).clone(), distance))
+    //                     }),
+    //                     |it| it.unzip(),
+    //                 )?;
+    //                 Ok((primary_keys, distances))
+    //             }),
+    //     )
+    //     .unwrap_or_else(|_| trace!("ann: unable to send response"));
 }
 
 /// Compare two CqlValues, returning an Ordering if they are comparable.
@@ -920,107 +929,107 @@ fn cql_cmp_tuple<'a>(
 fn filtered_ann(
     idx: Arc<impl UsearchIndex>,
     tx_ann: oneshot::Sender<AnnR>,
-    keys: &RwLock<BiMap<Arc<PrimaryKey>, Key>>,
+    keys: &RwLock<BiMap<Arc<PrimaryKeySmall>, Key>>,
     primary_key_columns: &[ColumnName],
     embedding: Vector,
     filter: Filter,
     limit: Limit,
 ) {
-    fn annotate<F>(f: F) -> F
-    where
-        F: for<'a, 'b> Fn(&'a PrimaryKey, &'b ColumnName) -> Option<&'a CqlValue>,
-    {
-        f
-    }
+    // fn annotate<F>(f: F) -> F
+    // where
+    //     F: for<'a, 'b> Fn(&'a PrimaryKey, &'b ColumnName) -> Option<&'a CqlValue>,
+    // {
+    //     f
+    // }
 
-    let primary_key_value = annotate(
-        |primary_key: &PrimaryKey, name: &ColumnName| -> Option<&CqlValue> {
-            primary_key_columns
-                .iter()
-                .position(|key_column| key_column == name)
-                .and_then(move |idx| primary_key.0.get(idx))
-        },
-    );
+    // let primary_key_value = annotate(
+    //     |primary_key: &PrimaryKey, name: &ColumnName| -> Option<&CqlValue> {
+    //         primary_key_columns
+    //             .iter()
+    //             .position(|key_column| key_column == name)
+    //             .and_then(move |idx| primary_key.0.get(idx))
+    //     },
+    // );
 
-    let id_ok = |key: Key| {
-        let Some(primary_key) = keys.read().unwrap().get_by_right(&key).cloned() else {
-            return false;
-        };
-        filter
-            .restrictions
-            .iter()
-            .all(|restriction| match restriction {
-                Restriction::Eq { lhs, rhs } => primary_key_value(&primary_key, lhs) == Some(rhs),
-                Restriction::In { lhs, rhs } => {
-                    let value = primary_key_value(&primary_key, lhs);
-                    rhs.iter().any(|rhs| value == Some(rhs))
-                }
-                Restriction::Lt { lhs, rhs } => primary_key_value(&primary_key, lhs)
-                    .and_then(|value| cql_cmp(value, rhs))
-                    .is_some_and(|ord| ord.is_lt()),
-                Restriction::Lte { lhs, rhs } => primary_key_value(&primary_key, lhs)
-                    .and_then(|value| cql_cmp(value, rhs))
-                    .is_some_and(|ord| ord.is_le()),
-                Restriction::Gt { lhs, rhs } => primary_key_value(&primary_key, lhs)
-                    .and_then(|value| cql_cmp(value, rhs))
-                    .is_some_and(|ord| ord.is_gt()),
-                Restriction::Gte { lhs, rhs } => primary_key_value(&primary_key, lhs)
-                    .and_then(|value| cql_cmp(value, rhs))
-                    .is_some_and(|ord| ord.is_ge()),
-                Restriction::EqTuple { lhs, rhs } => lhs
-                    .iter()
-                    .zip(rhs.iter())
-                    .all(|(lhs, rhs)| primary_key_value(&primary_key, lhs) == Some(rhs)),
-                Restriction::InTuple { lhs, rhs } => {
-                    let values: Vec<_> = lhs
-                        .iter()
-                        .map(|lhs| primary_key_value(&primary_key, lhs))
-                        .collect();
-                    rhs.iter().any(|rhs| {
-                        values
-                            .iter()
-                            .zip(rhs.iter())
-                            .all(|(value, rhs)| value == &Some(rhs))
-                    })
-                }
-                Restriction::LtTuple { lhs, rhs } => {
-                    cql_cmp_tuple(&primary_key, primary_key_value, lhs, rhs)
-                        .is_some_and(|ord| ord.is_lt())
-                }
-                Restriction::LteTuple { lhs, rhs } => {
-                    cql_cmp_tuple(&primary_key, primary_key_value, lhs, rhs)
-                        .is_some_and(|ord| ord.is_le())
-                }
-                Restriction::GtTuple { lhs, rhs } => {
-                    cql_cmp_tuple(&primary_key, primary_key_value, lhs, rhs)
-                        .is_some_and(|ord| ord.is_gt())
-                }
-                Restriction::GteTuple { lhs, rhs } => {
-                    cql_cmp_tuple(&primary_key, primary_key_value, lhs, rhs)
-                        .is_some_and(|ord| ord.is_ge())
-                }
-            })
-    };
+    // let id_ok = |key: Key| {
+    //     let Some(primary_key) = keys.read().unwrap().get_by_right(&key).cloned() else {
+    //         return false;
+    //     };
+    //     filter
+    //         .restrictions
+    //         .iter()
+    //         .all(|restriction| match restriction {
+    //             Restriction::Eq { lhs, rhs } => primary_key_value(&primary_key, lhs) == Some(rhs),
+    //             Restriction::In { lhs, rhs } => {
+    //                 let value = primary_key_value(&primary_key, lhs);
+    //                 rhs.iter().any(|rhs| value == Some(rhs))
+    //             }
+    //             Restriction::Lt { lhs, rhs } => primary_key_value(&primary_key, lhs)
+    //                 .and_then(|value| cql_cmp(value, rhs))
+    //                 .is_some_and(|ord| ord.is_lt()),
+    //             Restriction::Lte { lhs, rhs } => primary_key_value(&primary_key, lhs)
+    //                 .and_then(|value| cql_cmp(value, rhs))
+    //                 .is_some_and(|ord| ord.is_le()),
+    //             Restriction::Gt { lhs, rhs } => primary_key_value(&primary_key, lhs)
+    //                 .and_then(|value| cql_cmp(value, rhs))
+    //                 .is_some_and(|ord| ord.is_gt()),
+    //             Restriction::Gte { lhs, rhs } => primary_key_value(&primary_key, lhs)
+    //                 .and_then(|value| cql_cmp(value, rhs))
+    //                 .is_some_and(|ord| ord.is_ge()),
+    //             Restriction::EqTuple { lhs, rhs } => lhs
+    //                 .iter()
+    //                 .zip(rhs.iter())
+    //                 .all(|(lhs, rhs)| primary_key_value(&primary_key, lhs) == Some(rhs)),
+    //             Restriction::InTuple { lhs, rhs } => {
+    //                 let values: Vec<_> = lhs
+    //                     .iter()
+    //                     .map(|lhs| primary_key_value(&primary_key, lhs))
+    //                     .collect();
+    //                 rhs.iter().any(|rhs| {
+    //                     values
+    //                         .iter()
+    //                         .zip(rhs.iter())
+    //                         .all(|(value, rhs)| value == &Some(rhs))
+    //                 })
+    //             }
+    //             Restriction::LtTuple { lhs, rhs } => {
+    //                 cql_cmp_tuple(&primary_key, primary_key_value, lhs, rhs)
+    //                     .is_some_and(|ord| ord.is_lt())
+    //             }
+    //             Restriction::LteTuple { lhs, rhs } => {
+    //                 cql_cmp_tuple(&primary_key, primary_key_value, lhs, rhs)
+    //                     .is_some_and(|ord| ord.is_le())
+    //             }
+    //             Restriction::GtTuple { lhs, rhs } => {
+    //                 cql_cmp_tuple(&primary_key, primary_key_value, lhs, rhs)
+    //                     .is_some_and(|ord| ord.is_gt())
+    //             }
+    //             Restriction::GteTuple { lhs, rhs } => {
+    //                 cql_cmp_tuple(&primary_key, primary_key_value, lhs, rhs)
+    //                     .is_some_and(|ord| ord.is_ge())
+    //             }
+    //         })
+    // };
 
-    tx_ann
-        .send(
-            idx.filtered_search(&embedding, limit, id_ok)
-                .map_err(|err| anyhow!("ann: search failed: {err}"))
-                .and_then(|matches| {
-                    let keys = keys.read().unwrap();
-                    let (primary_keys, distances) = itertools::process_results(
-                        matches.map(|(key, distance)| {
-                            keys.get_by_right(&key)
-                                .cloned()
-                                .ok_or(anyhow!("not defined primary key column {key}"))
-                                .map(|primary_key| ((*primary_key).clone(), distance))
-                        }),
-                        |it| it.unzip(),
-                    )?;
-                    Ok((primary_keys, distances))
-                }),
-        )
-        .unwrap_or_else(|_| trace!("ann: unable to send response"));
+    // tx_ann
+    //     .send(
+    //         idx.filtered_search(&embedding, limit, id_ok)
+    //             .map_err(|err| anyhow!("ann: search failed: {err}"))
+    //             .and_then(|matches| {
+    //                 let keys = keys.read().unwrap();
+    //                 let (primary_keys, distances) = itertools::process_results(
+    //                     matches.map(|(key, distance)| {
+    //                         keys.get_by_right(&key)
+    //                             .cloned()
+    //                             .ok_or(anyhow!("not defined primary key column {key}"))
+    //                             .map(|primary_key| ((*primary_key).clone(), distance))
+    //                     }),
+    //                     |it| it.unzip(),
+    //                 )?;
+    //                 Ok((primary_keys, distances))
+    //             }),
+    //     )
+    //     .unwrap_or_else(|_| trace!("ann: unable to send response"));
 }
 
 fn count(idx: Arc<impl UsearchIndex>, tx: oneshot::Sender<CountR>) {

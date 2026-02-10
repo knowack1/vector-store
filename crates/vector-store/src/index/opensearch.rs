@@ -299,24 +299,24 @@ async fn process(
     opensearch_key: Arc<AtomicU64>,
     client: Arc<OpenSearch>,
 ) {
-    match msg {
-        Index::Add {
-            primary_key,
-            embedding,
-            in_progress: _in_progress,
-        } => add_or_replace(id, keys, opensearch_key, primary_key, embedding, client).await,
-        Index::Remove {
-            primary_key,
-            in_progress: _in_progress,
-        } => remove(id, keys, primary_key, client).await,
-        Index::Ann {
-            embedding,
-            limit,
-            tx,
-        } => ann(id, tx, keys, embedding, dimensions, limit, client).await,
-        Index::FilteredAnn { tx, .. } => filtered_ann(tx).await,
-        Index::Count { tx } => count(id, tx, client).await,
-    }
+    // match msg {
+    //     Index::Add {
+    //         primary_key,
+    //         embedding,
+    //         in_progress: _in_progress,
+    //     } => add_or_replace(id, keys, opensearch_key, primary_key, embedding, client).await,
+    //     Index::Remove {
+    //         primary_key,
+    //         in_progress: _in_progress,
+    //     } => remove(id, keys, primary_key, client).await,
+    //     Index::Ann {
+    //         embedding,
+    //         limit,
+    //         tx,
+    //     } => ann(id, tx, keys, embedding, dimensions, limit, client).await,
+    //     Index::FilteredAnn { tx, .. } => filtered_ann(tx).await,
+    //     Index::Count { tx } => count(id, tx, client).await,
+    // }
 }
 
 async fn add_or_replace(

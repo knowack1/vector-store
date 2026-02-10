@@ -248,10 +248,27 @@ impl SerializeValue for ColumnName {
     }
 }
 
-#[derive(Clone, Debug, derive_more::From)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum CqlValueSmall {
+    /// 32-bit signed integer.
+    Int(i32),
+    /// UTF-8 encoded string.
+    Text(String),
+}
+
+#[derive(Clone, Debug)]
 pub struct PrimaryKey(Vec<CqlValue>);
 
+#[derive(Clone, Debug, derive_more::From)]
+pub struct PrimaryKeySmall(Vec<CqlValueSmall>);
+
 impl Hash for PrimaryKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        format!("{self:?}").hash(state);
+    }
+}
+
+impl Hash for PrimaryKeySmall {
     fn hash<H: Hasher>(&self, state: &mut H) {
         format!("{self:?}").hash(state);
     }
@@ -263,7 +280,52 @@ impl PartialEq for PrimaryKey {
     }
 }
 
+impl PartialEq for PrimaryKeySmall {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(&other.0)
+    }
+}
+
+impl Eq for PrimaryKeySmall {}
+
 impl Eq for PrimaryKey {}
+
+impl From<Vec<scylla::value::CqlValue>> for PrimaryKey {
+    fn from(value: Vec<scylla::value::CqlValue>) -> Self {
+        Self(value)
+    }
+}
+
+impl From<PrimaryKey> for PrimaryKeySmall {
+    fn from(value: PrimaryKey) -> Self {
+        Self(
+            value
+                .0
+                .into_iter()
+                .map(|v| match v {
+                    scylla::value::CqlValue::Int(i) => CqlValueSmall::Int(i),
+                    scylla::value::CqlValue::Text(s) => CqlValueSmall::Text(s),
+                    _ => unimplemented!(),
+                })
+                .collect(),
+        )
+    }
+}
+
+impl From<PrimaryKeySmall> for PrimaryKey {
+    fn from(value: PrimaryKeySmall) -> Self {
+        Self(
+            value
+                .0
+                .into_iter()
+                .map(|v| match v {
+                    CqlValueSmall::Int(i) => scylla::value::CqlValue::Int(i),
+                    CqlValueSmall::Text(s) => scylla::value::CqlValue::Text(s),
+                })
+                .collect(),
+        )
+    }
+}
 
 #[derive(
     Clone,

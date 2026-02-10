@@ -10,6 +10,7 @@ use crate::Distance;
 use crate::Filter;
 use crate::Limit;
 use crate::PrimaryKey;
+use crate::PrimaryKeySmall;
 use crate::Vector;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -19,12 +20,12 @@ pub(crate) type CountR = anyhow::Result<usize>;
 
 pub enum Index {
     Add {
-        primary_key: Arc<PrimaryKey>,
+        primary_key: Arc<PrimaryKeySmall>,
         embedding: Vector,
         in_progress: Option<AsyncInProgress>,
     },
     Remove {
-        primary_key: PrimaryKey,
+        primary_key: PrimaryKeySmall,
         in_progress: Option<AsyncInProgress>,
     },
     Ann {
@@ -46,11 +47,11 @@ pub enum Index {
 pub(crate) trait IndexExt {
     async fn add(
         &self,
-        primary_key: Arc<PrimaryKey>,
+        primary_key: Arc<PrimaryKeySmall>,
         embedding: Vector,
         in_progress: Option<AsyncInProgress>,
     );
-    async fn remove(&self, primary_key: PrimaryKey, in_progress: Option<AsyncInProgress>);
+    async fn remove(&self, primary_key: PrimaryKeySmall, in_progress: Option<AsyncInProgress>);
     async fn ann(&self, embedding: Vector, limit: Limit) -> AnnR;
     async fn filtered_ann(&self, embedding: Vector, filter: Filter, limit: Limit) -> AnnR;
     async fn count(&self) -> CountR;
@@ -59,7 +60,7 @@ pub(crate) trait IndexExt {
 impl IndexExt for mpsc::Sender<Index> {
     async fn add(
         &self,
-        primary_key: Arc<PrimaryKey>,
+        primary_key: Arc<PrimaryKeySmall>,
         embedding: Vector,
         in_progress: Option<AsyncInProgress>,
     ) {
@@ -72,7 +73,7 @@ impl IndexExt for mpsc::Sender<Index> {
         .expect("internal actor should receive request");
     }
 
-    async fn remove(&self, primary_key: PrimaryKey, in_progress: Option<AsyncInProgress>) {
+    async fn remove(&self, primary_key: PrimaryKeySmall, in_progress: Option<AsyncInProgress>) {
         self.send(Index::Remove {
             primary_key,
             in_progress,

@@ -4,14 +4,18 @@
  */
 
 use crate::AsyncInProgress;
+use crate::CqlValueSmall;
 use crate::DbEmbedding;
 use crate::IndexId;
 use crate::Metrics;
-use crate::PrimaryKey;
+// use crate::PrimaryKey;
+use crate::PrimaryKeySmall;
 use crate::Timestamp;
 use crate::index::Index;
 use crate::index::IndexExt;
+use scylla::value::CqlValue;
 use std::collections::HashMap;
+use std::mem;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
@@ -37,7 +41,7 @@ pub(crate) async fn new(
         async move {
             debug!("starting");
 
-            let mut timestamps: HashMap<Arc<PrimaryKey>, Timestamp> = HashMap::new();
+            let mut timestamps: HashMap<Arc<PrimaryKeySmall>, Timestamp> = HashMap::new();
 
             while !rx.is_closed() {
                 tokio::select! {
@@ -59,7 +63,7 @@ pub(crate) async fn new(
 }
 
 async fn add(
-    timestamps: &mut HashMap<Arc<PrimaryKey>, Timestamp>,
+    timestamps: &mut HashMap<Arc<PrimaryKeySmall>, Timestamp>,
     index: &Sender<Index>,
     embedding: DbEmbedding,
     in_progress: Option<AsyncInProgress>,
@@ -69,7 +73,19 @@ async fn add(
     let mut modify = true;
     let mut remove_before_add = false;
 
-    let primary_key = Arc::new(embedding.primary_key.clone());
+    let primary_key: Arc<PrimaryKeySmall> = Arc::new(embedding.primary_key.clone().into());
+    // let stack_size = mem::size_of_val(&embedding.primary_key);
+    // let heap_capacity_bytes = embedding.primary_key.0.capacity() * mem::size_of::<CqlValueSmall>();
+
+    // dbg!(
+    //     "capacity of {:?}: {} stack size: {} heap capacity: {} total: {} mem::size_of::<CqlValue>(): {}",
+    //     &primary_key,
+    //     embedding.primary_key.0.capacity(),
+    //     stack_size,
+    //     heap_capacity_bytes,
+    //     stack_size + heap_capacity_bytes,
+    //     mem::size_of::<CqlValueSmall>()
+    // );
     timestamps
         .entry(Arc::clone(&primary_key))
         .and_modify(|timestamp| {
