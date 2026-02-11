@@ -33,6 +33,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use uuid::Uuid;
@@ -72,7 +73,7 @@ const TAG_BLOB: u8 = 18;
 /// and more correct than the previous `format!("{:?}")` hashing approach.
 #[derive(Clone)]
 pub struct PrimaryKey {
-    data: Box<[u8]>,
+    data: Arc<[u8]>,
 }
 
 impl PrimaryKey {
@@ -98,7 +99,7 @@ impl PrimaryKey {
         debug_assert_eq!(buf.len(), total);
 
         PrimaryKey {
-            data: buf.into_boxed_slice(),
+            data: Arc::from(buf),
         }
     }
 
@@ -430,7 +431,7 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<PrimaryKey>(),
             16,
-            "PrimaryKey should be 16 bytes (Box<[u8]> = ptr + len)"
+            "PrimaryKey should be 16 bytes (Arc<[u8]> = ptr + len)"
         );
     }
 
