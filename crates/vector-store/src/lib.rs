@@ -16,6 +16,7 @@ mod metrics;
 mod monitor_indexes;
 mod monitor_items;
 pub mod node_state;
+mod primary_key;
 
 use crate::internals::Internals;
 use crate::metrics::Metrics;
@@ -25,6 +26,7 @@ pub use httproutes::DataType;
 pub use httproutes::IndexInfo;
 use index::factory;
 pub use index::factory::IndexFactory;
+pub use primary_key::PrimaryKey;
 use scylla::cluster::metadata::ColumnType;
 use scylla::serialize::SerializationError;
 use scylla::serialize::value::SerializeValue;
@@ -34,7 +36,6 @@ use scylla::value::CqlValue;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::hash::Hasher;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
@@ -248,22 +249,6 @@ impl SerializeValue for ColumnName {
     }
 }
 
-#[derive(Clone, Debug, derive_more::From)]
-pub struct PrimaryKey(Vec<CqlValue>);
-
-impl Hash for PrimaryKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        format!("{self:?}").hash(state);
-    }
-}
-
-impl PartialEq for PrimaryKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.eq(&other.0)
-    }
-}
-
-impl Eq for PrimaryKey {}
 
 #[derive(
     Clone,
