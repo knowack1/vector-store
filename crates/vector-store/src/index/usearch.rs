@@ -603,7 +603,7 @@ mod operation {
 
 struct IndexState<I: UsearchIndex + Send + Sync + 'static> {
     idx: Arc<I>,
-    keys: RwLock<BiMap<Arc<PrimaryKey>, Key>>,
+    keys: RwLock<BiMap<PrimaryKey, Key>>,
     dimensions: Dimensions,
     usearch_key: AtomicU64,
 }
@@ -791,7 +791,7 @@ fn reserve(idx: &impl UsearchIndex, capacity: usize) {
 
 fn needs_more_capacity(
     idx: &impl UsearchIndex,
-    keys: &RwLock<BiMap<Arc<PrimaryKey>, Key>>,
+    keys: &RwLock<BiMap<PrimaryKey, Key>>,
 ) -> Option<usize> {
     let capacity = idx.capacity();
     let free_space = capacity - keys.read().unwrap().len();
@@ -805,9 +805,9 @@ fn needs_more_capacity(
 
 fn add(
     idx: &impl UsearchIndex,
-    keys: &RwLock<BiMap<Arc<PrimaryKey>, Key>>,
+    keys: &RwLock<BiMap<PrimaryKey, Key>>,
     usearch_key: &AtomicU64,
-    primary_key: Arc<PrimaryKey>,
+    primary_key: PrimaryKey,
     embedding: Vector,
 ) {
     let key = usearch_key.fetch_add(1, Ordering::Relaxed).into();
@@ -815,14 +815,10 @@ fn add(
         debug!("add: unable to add embedding for key {key}: {err}");
         return;
     };
-    let _ = keys.write().unwrap().insert(primary_key, key);
+    let _ = keys.write().unwrap().insert(primary_key.clone(), key);
 }
 
-fn remove(
-    idx: &impl UsearchIndex,
-    keys: &RwLock<BiMap<Arc<PrimaryKey>, Key>>,
-    primary_key: PrimaryKey,
-) {
+fn remove(idx: &impl UsearchIndex, keys: &RwLock<BiMap<PrimaryKey, Key>>, primary_key: PrimaryKey) {
     let Some((_, key)) = keys.write().unwrap().remove_by_left(&primary_key) else {
         return;
     };
@@ -850,7 +846,7 @@ fn validate_dimensions(
 fn ann(
     idx: Arc<impl UsearchIndex>,
     tx_ann: oneshot::Sender<AnnR>,
-    keys: &RwLock<BiMap<Arc<PrimaryKey>, Key>>,
+    keys: &RwLock<BiMap<PrimaryKey, Key>>,
     embedding: Vector,
     limit: Limit,
 ) {
@@ -865,7 +861,7 @@ fn ann(
                             keys.get_by_right(&key)
                                 .cloned()
                                 .ok_or(anyhow!("not defined primary key column {key}"))
-                                .map(|primary_key| ((*primary_key).clone(), distance))
+                                .map(|primary_key| (primary_key, distance))
                         }),
                         |it| it.unzip(),
                     )?;
@@ -920,7 +916,7 @@ fn cql_cmp_tuple<'a>(
 fn filtered_ann(
     idx: Arc<impl UsearchIndex>,
     tx_ann: oneshot::Sender<AnnR>,
-    keys: &RwLock<BiMap<Arc<PrimaryKey>, Key>>,
+    keys: &RwLock<BiMap<PrimaryKey, Key>>,
     primary_key_columns: &[ColumnName],
     embedding: Vector,
     filter: Filter,
@@ -1013,7 +1009,7 @@ fn filtered_ann(
                             keys.get_by_right(&key)
                                 .cloned()
                                 .ok_or(anyhow!("not defined primary key column {key}"))
-                                .map(|primary_key| ((*primary_key).clone(), distance))
+                                .map(|primary_key| (primary_key, distance))
                         }),
                         |it| it.unzip(),
                     )?;

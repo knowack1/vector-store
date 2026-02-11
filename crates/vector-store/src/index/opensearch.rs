@@ -159,8 +159,6 @@ pub fn new_opensearch(
 /// Key for index embeddings
 struct Key(u64);
 
-type KeyMap = BiMap<Arc<PrimaryKey>, Key>;
-
 async fn create_index(
     id: &IndexId,
     dimensions: Dimensions,
@@ -295,7 +293,7 @@ async fn process(
     msg: Index,
     dimensions: Dimensions,
     id: Arc<IndexId>,
-    keys: Arc<RwLock<KeyMap>>,
+    keys: Arc<RwLock<BiMap<PrimaryKey, Key>>>,
     opensearch_key: Arc<AtomicU64>,
     client: Arc<OpenSearch>,
 ) {
@@ -321,9 +319,9 @@ async fn process(
 
 async fn add_or_replace(
     id: Arc<IndexId>,
-    keys: Arc<RwLock<KeyMap>>,
+    keys: Arc<RwLock<BiMap<PrimaryKey, Key>>>,
     opensearch_key: Arc<AtomicU64>,
-    primary_key: Arc<PrimaryKey>,
+    primary_key: PrimaryKey,
     embeddings: Vector,
     client: Arc<OpenSearch>,
 ) {
@@ -384,7 +382,7 @@ async fn add_or_replace(
 
 async fn remove(
     id: Arc<IndexId>,
-    keys: Arc<RwLock<KeyMap>>,
+    keys: Arc<RwLock<BiMap<PrimaryKey, Key>>>,
     primary_key: PrimaryKey,
     client: Arc<OpenSearch>,
 ) {
@@ -410,7 +408,7 @@ async fn remove(
 async fn ann(
     id: Arc<IndexId>,
     tx_ann: oneshot::Sender<AnnR>,
-    keys: Arc<RwLock<KeyMap>>,
+    keys: Arc<RwLock<BiMap<PrimaryKey, Key>>>,
     embedding: Vector,
     dimensions: Dimensions,
     limit: Limit,
@@ -478,8 +476,7 @@ async fn ann(
         })
         .collect::<Vec<_>>();
 
-    let (keys, scores): (Vec<Arc<PrimaryKey>>, Vec<_>) = hits.iter().cloned().unzip();
-    let keys: Vec<PrimaryKey> = keys.iter().map(|k| (**k).clone()).collect();
+    let (keys, scores): (Vec<_>, Vec<_>) = hits.iter().cloned().unzip();
     let distances = scores
         .iter()
         .map(|score| Distance(*score as f32))

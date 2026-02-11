@@ -37,7 +37,7 @@ pub(crate) async fn new(
         async move {
             debug!("starting");
 
-            let mut timestamps: HashMap<Arc<PrimaryKey>, Timestamp> = HashMap::new();
+            let mut timestamps: HashMap<PrimaryKey, Timestamp> = HashMap::new();
 
             while !rx.is_closed() {
                 tokio::select! {
@@ -59,7 +59,7 @@ pub(crate) async fn new(
 }
 
 async fn add(
-    timestamps: &mut HashMap<Arc<PrimaryKey>, Timestamp>,
+    timestamps: &mut HashMap<PrimaryKey, Timestamp>,
     index: &Sender<Index>,
     embedding: DbEmbedding,
     in_progress: Option<AsyncInProgress>,
@@ -68,10 +68,8 @@ async fn add(
 ) {
     let mut modify = true;
     let mut remove_before_add = false;
-
-    let primary_key = Arc::new(embedding.primary_key.clone());
     timestamps
-        .entry(Arc::clone(&primary_key))
+        .entry(embedding.primary_key.clone())
         .and_modify(|timestamp| {
             if timestamp.0 < embedding.timestamp.0 {
                 *timestamp = embedding.timestamp;
@@ -82,7 +80,7 @@ async fn add(
         })
         .or_insert(embedding.timestamp);
     if modify {
-        // let primary_key = embedding.primary_key;
+        let primary_key = embedding.primary_key;
         if let Some(embedding) = embedding.embedding {
             metrics
                 .modified
@@ -93,11 +91,9 @@ async fn add(
                 ])
                 .inc();
             if remove_before_add {
-                index.remove((*primary_key).clone(), None).await;
+                index.remove(primary_key.clone(), None).await;
             }
-            index
-                .add(Arc::clone(&primary_key), embedding, in_progress)
-                .await;
+            index.add(primary_key, embedding, in_progress).await;
         } else {
             metrics
                 .modified
@@ -107,7 +103,7 @@ async fn add(
                     "remove",
                 ])
                 .inc();
-            index.remove((*primary_key).clone(), in_progress).await;
+            index.remove(primary_key, in_progress).await;
         }
         metrics.mark_dirty(
             id.keyspace().as_ref().as_str(),
