@@ -606,16 +606,16 @@ async fn post_index_ann(
                         let primary_keys: anyhow::Result<_> = primary_keys
                             .iter()
                             .map(|primary_key| {
-                                if primary_key.0.len() != primary_key_columns.len() {
+                                if primary_key.len() != primary_key_columns.len() {
                                     bail!(
                                         "wrong size of a primary key: {}, {}",
                                         primary_key_columns.len(),
-                                        primary_key.0.len()
+                                        primary_key.len()
                                     );
                                 }
                                 Ok(primary_key)
                             })
-                            .map_ok(|primary_key| primary_key.0[idx_column].clone())
+                            .map_ok(|primary_key| primary_key.get(idx_column).unwrap())
                             .map_ok(try_to_json)
                             .map(|primary_key| primary_key.flatten())
                             .collect();
