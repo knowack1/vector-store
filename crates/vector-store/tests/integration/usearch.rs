@@ -141,7 +141,7 @@ pub(crate) async fn setup_store_with_quantization(
     let run = {
         let node_state = node_state.clone();
         async move {
-            let (server, addr) =
+            let (server, addr, _mtls_addr) =
                 vector_store::run(node_state, db_actor, internals, index_factory, config_rx)
                     .await
                     .unwrap();
@@ -286,7 +286,7 @@ async fn failed_db_index_create() {
 
     let (_config_tx, config_rx) = watch::channel(Arc::new(test_config()));
 
-    let (_server_actor, addr) =
+    let (_server_actor, addr, _mtls_addr) =
         vector_store::run(node_state, db_actor, internals, index_factory, config_rx)
             .await
             .unwrap();

@@ -19,7 +19,7 @@ async fn run_vs(
 
     let (_config_tx, config_rx) = watch::channel(Arc::new(test_config()));
 
-    let (server, addr) =
+    let (server, addr, _mtls_addr) =
         vector_store::run(node_state, db_actor, internals, index_factory, config_rx)
             .await
             .unwrap();

@@ -95,7 +95,7 @@ fn main() -> anyhow::Result<()> {
         let db_actor =
             vector_store::new_db(node_state.clone(), internals.clone(), config_rx.clone()).await?;
 
-        let (_server_actor, addr) = vector_store::run(
+        let (_server_actor, addr, mtls_addr) = vector_store::run(
             node_state,
             db_actor,
             internals,
@@ -104,6 +104,9 @@ fn main() -> anyhow::Result<()> {
         )
         .await?;
         tracing::info!("listening on {addr}");
+        if let Some(mtls_addr) = mtls_addr {
+            tracing::info!("mTLS listening on {mtls_addr}");
+        }
 
         vector_store::wait_for_shutdown().await;
 

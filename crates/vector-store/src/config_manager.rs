@@ -221,6 +221,42 @@ where
     }))
 }
 
+fn load_mtls_config<F>(env: &F, config: &mut Config) -> anyhow::Result<()>
+where
+    F: Fn(&'static str) -> Result<String, std::env::VarError>,
+{
+    let mtls_ca_cert_path = env("VECTOR_STORE_MTLS_CA_CERT_PATH")
+        .ok()
+        .map(std::path::PathBuf::from);
+
+    let mtls_addr = env("VECTOR_STORE_MTLS_URI")
+        .ok()
+        .map(|v| {
+            v.to_socket_addrs()
+                .map_err(|_| anyhow!("Unable to parse VECTOR_STORE_MTLS_URI env (host:port)"))?
+                .next()
+                .ok_or(anyhow!(
+                    "Unable to parse VECTOR_STORE_MTLS_URI env (host:port)"
+                ))
+        })
+        .transpose()?;
+
+    let mtls_addr = match (mtls_addr, &mtls_ca_cert_path) {
+        (Some(addr), Some(_)) => Some(addr),
+        (None, Some(_)) => Some("127.0.0.1:6081".parse().unwrap()),
+        (_, None) => None,
+    };
+
+    if mtls_addr.is_some() && (config.tls_cert_path.is_none() || config.tls_key_path.is_none()) {
+        bail!("mTLS requires VECTOR_STORE_TLS_CERT_PATH and VECTOR_STORE_TLS_KEY_PATH to be set")
+    }
+
+    config.mtls_addr = mtls_addr;
+    config.mtls_ca_cert_path = mtls_ca_cert_path;
+
+    Ok(())
+}
+
 pub async fn load_config<F>(env: F) -> anyhow::Result<Config>
 where
     F: Fn(&'static str) -> Result<String, std::env::VarError>,
@@ -359,6 +395,8 @@ where
             )
         }
     }
+
+    load_mtls_config(&env, &mut config)?;
 
     Ok(config)
 }
@@ -533,6 +571,8 @@ mod tests {
             disable_colors: false,
             tls_cert_path: None,
             tls_key_path: None,
+            mtls_addr: None,
+            mtls_ca_cert_path: None,
             cql_keepalive_interval: None,
             cql_keepalive_timeout: None,
             cql_tcp_keepalive_interval: None,
@@ -638,6 +678,121 @@ mod tests {
         assert_eq!(
             config.memory_usage_check_interval,
             Some(Duration::from_millis(100))
+        );
+    }
+
+    #[tokio::test]
+    async fn mtls_none_when_not_configured() {
+        let env = mock_env(HashMap::new());
+        let config = load_config(env).await.unwrap();
+        assert!(config.mtls_addr.is_none());
+        assert!(config.mtls_ca_cert_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn mtls_with_uri_only_is_ignored() {
+        let env = mock_env(HashMap::from([
+            ("VECTOR_STORE_MTLS_URI", "127.0.0.1:8443".into()),
+            ("VECTOR_STORE_TLS_CERT_PATH", "/path/to/cert.pem".into()),
+            ("VECTOR_STORE_TLS_KEY_PATH", "/path/to/key.pem".into()),
+        ]));
+        let config = load_config(env).await.unwrap();
+        assert!(
+            config.mtls_addr.is_none(),
+            "mTLS should not activate without VECTOR_STORE_MTLS_CA_CERT_PATH"
+        );
+        assert!(config.mtls_ca_cert_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn mtls_with_uri_and_ca_cert() {
+        let env = mock_env(HashMap::from([
+            ("VECTOR_STORE_MTLS_URI", "127.0.0.1:8443".into()),
+            ("VECTOR_STORE_MTLS_CA_CERT_PATH", "/path/to/ca.pem".into()),
+            ("VECTOR_STORE_TLS_CERT_PATH", "/path/to/cert.pem".into()),
+            ("VECTOR_STORE_TLS_KEY_PATH", "/path/to/key.pem".into()),
+        ]));
+        let config = load_config(env).await.unwrap();
+        assert_eq!(config.mtls_addr.unwrap().to_string(), "127.0.0.1:8443");
+        assert_eq!(
+            config.mtls_ca_cert_path.unwrap(),
+            std::path::PathBuf::from("/path/to/ca.pem")
+        );
+    }
+
+    #[tokio::test]
+    async fn mtls_error_when_tls_cert_missing() {
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_MTLS_CA_CERT_PATH",
+            "/path/to/ca.pem".into(),
+        )]));
+        let result = load_config(env).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "mTLS requires VECTOR_STORE_TLS_CERT_PATH and VECTOR_STORE_TLS_KEY_PATH to be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn mtls_ca_cert_only_defaults_addr() {
+        let env = mock_env(HashMap::from([
+            ("VECTOR_STORE_MTLS_CA_CERT_PATH", "/path/to/ca.pem".into()),
+            ("VECTOR_STORE_TLS_CERT_PATH", "/path/to/cert.pem".into()),
+            ("VECTOR_STORE_TLS_KEY_PATH", "/path/to/key.pem".into()),
+        ]));
+        let config = load_config(env).await.unwrap();
+        assert_eq!(
+            config.mtls_addr.unwrap().to_string(),
+            "127.0.0.1:6081",
+            "should default to 127.0.0.1:6081 when VECTOR_STORE_MTLS_URI is not set"
+        );
+        assert_eq!(
+            config.mtls_ca_cert_path,
+            Some(std::path::PathBuf::from("/path/to/ca.pem")),
+        );
+    }
+
+    #[tokio::test]
+    async fn mtls_error_when_only_tls_cert_set() {
+        let env = mock_env(HashMap::from([
+            ("VECTOR_STORE_MTLS_CA_CERT_PATH", "/path/to/ca.pem".into()),
+            ("VECTOR_STORE_TLS_CERT_PATH", "/path/to/cert.pem".into()),
+        ]));
+        let result = load_config(env).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Both VECTOR_STORE_TLS_CERT_PATH and VECTOR_STORE_TLS_KEY_PATH must be set together"
+        );
+    }
+
+    #[tokio::test]
+    async fn mtls_error_when_only_tls_key_set() {
+        let env = mock_env(HashMap::from([
+            ("VECTOR_STORE_MTLS_CA_CERT_PATH", "/path/to/ca.pem".into()),
+            ("VECTOR_STORE_TLS_KEY_PATH", "/path/to/key.pem".into()),
+        ]));
+        let result = load_config(env).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Both VECTOR_STORE_TLS_CERT_PATH and VECTOR_STORE_TLS_KEY_PATH must be set together"
+        );
+    }
+
+    #[tokio::test]
+    async fn mtls_error_when_uri_invalid() {
+        let env = mock_env(HashMap::from([
+            ("VECTOR_STORE_MTLS_URI", "not-a-valid-address".into()),
+            ("VECTOR_STORE_TLS_CERT_PATH", "/path/to/cert.pem".into()),
+            ("VECTOR_STORE_TLS_KEY_PATH", "/path/to/key.pem".into()),
+        ]));
+        let result = load_config(env).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Unable to parse VECTOR_STORE_MTLS_URI env (host:port)"
         );
     }
 }

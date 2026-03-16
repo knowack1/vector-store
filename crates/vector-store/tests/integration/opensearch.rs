@@ -49,7 +49,7 @@ async fn simple_create_search_delete_index() {
 
     let (_config_tx, config_rx) = watch::channel(Arc::new(test_config()));
 
-    let (_server_actor, addr) =
+    let (_server_actor, addr, _mtls_addr) =
         vector_store::run(node_state, db_actor, internals, index_factory, config_rx)
             .await
             .unwrap();

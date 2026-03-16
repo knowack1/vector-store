@@ -95,6 +95,8 @@ pub struct Config {
     pub disable_colors: bool,
     pub tls_cert_path: Option<std::path::PathBuf>,
     pub tls_key_path: Option<std::path::PathBuf>,
+    pub mtls_addr: Option<std::net::SocketAddr>,
+    pub mtls_ca_cert_path: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -111,6 +113,8 @@ impl Default for Config {
             disable_colors: false,
             tls_cert_path: None,
             tls_key_path: None,
+            mtls_addr: None,
+            mtls_ca_cert_path: None,
             cql_keepalive_interval: None,
             cql_keepalive_timeout: None,
             cql_tcp_keepalive_interval: None,
@@ -603,7 +607,7 @@ pub async fn run(
     internals: Sender<Internals>,
     index_factory: Box<dyn IndexFactory + Send + Sync>,
     config_rx: watch::Receiver<Arc<Config>>,
-) -> anyhow::Result<(impl Sized, SocketAddr)> {
+) -> anyhow::Result<(impl Sized, SocketAddr, Option<SocketAddr>)> {
     let metrics: Arc<Metrics> = Arc::new(metrics::Metrics::new());
     let index_engine_version = index_factory.index_engine_version();
     httpserver::new(
