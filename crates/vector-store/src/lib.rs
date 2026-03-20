@@ -95,6 +95,7 @@ pub struct Config {
     pub disable_colors: bool,
     pub tls_cert_path: Option<std::path::PathBuf>,
     pub tls_key_path: Option<std::path::PathBuf>,
+    pub mtls_ca_cert_path: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -111,6 +112,7 @@ impl Default for Config {
             disable_colors: false,
             tls_cert_path: None,
             tls_key_path: None,
+            mtls_ca_cert_path: None,
             cql_keepalive_interval: None,
             cql_keepalive_timeout: None,
             cql_tcp_keepalive_interval: None,
@@ -602,6 +604,7 @@ fn http_server_config(config: &Config) -> httpserver::HttpServerConfig {
         addr: config.vector_store_addr,
         tls_cert_path: config.tls_cert_path.clone(),
         tls_key_path: config.tls_key_path.clone(),
+        mtls_ca_cert_path: config.mtls_ca_cert_path.clone(),
     }
 }
 

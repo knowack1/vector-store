@@ -299,6 +299,9 @@ where
     let tls_key_path = env("VECTOR_STORE_TLS_KEY_PATH")
         .ok()
         .map(std::path::PathBuf::from);
+    let mtls_ca_cert_path = env("VECTOR_STORE_MTLS_CA_CERT_PATH")
+        .ok()
+        .map(std::path::PathBuf::from);
 
     config.cql_keepalive_interval = env("VECTOR_STORE_CQL_KEEPALIVE_INTERVAL")
         .ok()
@@ -359,6 +362,16 @@ where
             )
         }
     }
+
+    if mtls_ca_cert_path.is_some()
+        && (config.tls_cert_path.is_none() || config.tls_key_path.is_none())
+    {
+        bail!(
+            "VECTOR_STORE_MTLS_CA_CERT_PATH requires both \
+             VECTOR_STORE_TLS_CERT_PATH and VECTOR_STORE_TLS_KEY_PATH to be set"
+        );
+    }
+    config.mtls_ca_cert_path = mtls_ca_cert_path;
 
     Ok(config)
 }
@@ -533,6 +546,7 @@ mod tests {
             disable_colors: false,
             tls_cert_path: None,
             tls_key_path: None,
+            mtls_ca_cert_path: None,
             cql_keepalive_interval: None,
             cql_keepalive_timeout: None,
             cql_tcp_keepalive_interval: None,
