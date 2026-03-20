@@ -597,6 +597,32 @@ pub fn block_on<Output>(threads: Option<usize>, f: impl AsyncFnOnce() -> Output)
         .block_on(async move { f().await })
 }
 
+fn http_server_config(config: &Config) -> httpserver::HttpServerConfig {
+    httpserver::HttpServerConfig {
+        addr: config.vector_store_addr,
+        tls_cert_path: config.tls_cert_path.clone(),
+        tls_key_path: config.tls_key_path.clone(),
+    }
+}
+
+fn spawn_http_server_config_bridge(
+    mut config_rx: watch::Receiver<Arc<Config>>,
+) -> watch::Receiver<httpserver::HttpServerConfig> {
+    let initial = http_server_config(&config_rx.borrow());
+    let (tx, rx) = watch::channel(initial);
+
+    tokio::spawn(async move {
+        while config_rx.changed().await.is_ok() {
+            let new = http_server_config(&config_rx.borrow());
+            if tx.send(new).is_err() {
+                break;
+            }
+        }
+    });
+
+    rx
+}
+
 pub async fn run(
     node_state: Sender<NodeState>,
     db_actor: Sender<Db>,
@@ -606,6 +632,7 @@ pub async fn run(
 ) -> anyhow::Result<(impl Sized, SocketAddr)> {
     let metrics: Arc<Metrics> = Arc::new(metrics::Metrics::new());
     let index_engine_version = index_factory.index_engine_version();
+    let http_config_rx = spawn_http_server_config_bridge(config_rx.clone());
     httpserver::new(
         node_state.clone(),
         engine::new(
@@ -613,13 +640,13 @@ pub async fn run(
             index_factory,
             node_state,
             metrics.clone(),
-            config_rx.clone(),
+            config_rx,
         )
         .await?,
         metrics,
         internals,
         index_engine_version,
-        config_rx,
+        http_config_rx,
     )
     .await
 }
