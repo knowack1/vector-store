@@ -88,13 +88,105 @@ async fn spawn_server_with_retry(
     unreachable!()
 }
 
+async fn enable_server(
+    config: &HttpServerConfig,
+    deps: &ServerDeps,
+) -> anyhow::Result<(Handle, SocketAddr)> {
+    tracing::info!("HTTP server being enabled");
+    let (handle, addr) = spawn_server_with_retry(config, deps).await?;
+    tracing::info!(
+        "{} server started successfully on {}",
+        config.protocol_label(),
+        addr
+    );
+    Ok((handle, addr))
+}
+
+fn disable_server(handle: Option<Handle>) {
+    tracing::info!("HTTP server being disabled");
+    if let Some(handle) = handle {
+        handle.graceful_shutdown(Some(Duration::from_secs(10)));
+        tracing::info!("HTTP server shut down");
+    }
+}
+
+async fn reload_server(
+    old_config: &HttpServerConfig,
+    new_config: &HttpServerConfig,
+    current_handle: Option<Handle>,
+    deps: &ServerDeps,
+) -> (Option<Handle>, Option<SocketAddr>) {
+    let changes = describe_config_changes(old_config, new_config);
+    tracing::info!("HTTP server configuration changed ({changes}), reloading...");
+
+    if let Some(handle) = current_handle {
+        tracing::info!("Shutting down old HTTP server");
+        handle.graceful_shutdown(Some(Duration::from_secs(10)));
+    }
+
+    match spawn_server_with_retry(new_config, deps).await {
+        Ok((handle, addr)) => {
+            tracing::info!(
+                "{} server reloaded successfully on {}",
+                new_config.protocol_label(),
+                addr
+            );
+            (Some(handle), Some(addr))
+        }
+        Err(e) => {
+            tracing::error!("Failed to reload HTTP server: {e}");
+            tracing::error!(
+                "HTTP server is now offline - previous server was shut down but new server failed to start"
+            );
+            (None, None)
+        }
+    }
+}
+
+async fn handle_config_change(
+    current_config: &Option<Arc<HttpServerConfig>>,
+    new_config: &Option<Arc<HttpServerConfig>>,
+    current_handle: Option<Handle>,
+    deps: &ServerDeps,
+    addr_tx: &watch::Sender<Option<SocketAddr>>,
+) -> Option<Handle> {
+    match (current_config, new_config) {
+        (None, None) => current_handle,
+        (None, Some(config)) => match enable_server(config, deps).await {
+            Ok((handle, addr)) => {
+                addr_tx.send(Some(addr)).ok();
+                Some(handle)
+            }
+            Err(e) => {
+                tracing::error!("Failed to start HTTP server: {e}");
+                addr_tx.send(None).ok();
+                None
+            }
+        },
+        (Some(_), None) => {
+            disable_server(current_handle);
+            addr_tx.send(None).ok();
+            None
+        }
+        (Some(old), Some(new)) => {
+            if **old != **new {
+                let (handle, addr) = reload_server(old, new, current_handle, deps).await;
+                addr_tx.send(addr).ok();
+                handle
+            } else {
+                current_handle
+            }
+        }
+    }
+}
+
 pub(crate) async fn new(
     state: Sender<NodeState>,
     engine: Sender<Engine>,
     metrics: Arc<Metrics>,
     internals: Sender<Internals>,
     index_engine_version: String,
-    mut config_rx: watch::Receiver<Arc<HttpServerConfig>>,
+    mut config_rx: watch::Receiver<Option<Arc<HttpServerConfig>>>,
 ) -> anyhow::Result<Sender<HttpServer>> {
     // minimal size as channel is used as a lifetime guard
     const CHANNEL_SIZE: usize = 1;
@@ -112,13 +204,18 @@ pub(crate) async fn new(
 
     let initial_config = config_rx.borrow().clone();
 
-    // Start initial server and get actual bound address
-    let (initial_handle, actual_addr) = spawn_server_with_retry(&initial_config, &deps).await?;
-    addr_tx.send(Some(actual_addr)).ok();
+    // Start initial server if config is provided
+    let mut current_handle = if let Some(ref config) = initial_config {
+        let (handle, actual_addr) = spawn_server_with_retry(config, &deps).await?;
+        addr_tx.send(Some(actual_addr)).ok();
+        Some(handle)
+    } else {
+        tracing::info!("HTTP server disabled by configuration");
+        None
+    };
 
     // Spawn supervisor task that monitors config changes and manages server restarts
     tokio::spawn(async move {
-        let mut current_handle = initial_handle;
         let mut current_config = initial_config;
 
         loop {
@@ -138,43 +235,23 @@ pub(crate) async fn new(
 
                     let new_config = config_rx.borrow().clone();
 
-                    if *current_config != *new_config {
-                        let changes = describe_config_changes(&current_config, &new_config);
-                        tracing::info!("HTTP server configuration changed ({changes}), reloading...");
-
-                        // Gracefully shutdown old server and wait for it to complete
-                        tracing::info!("Shutting down old HTTP server");
-                        current_handle.graceful_shutdown(Some(Duration::from_secs(10)));
-
-                        // Start new server with retry
-                        match spawn_server_with_retry(&new_config, &deps).await {
-                            Ok((handle, new_actual_addr)) => {
-                                current_handle = handle;
-                                current_config = new_config;
-                                tracing::info!(
-                                    "{} server reloaded successfully on {}",
-                                    current_config.protocol_label(),
-                                    new_actual_addr
-                                );
-                                addr_tx.send(Some(new_actual_addr)).ok();
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to reload HTTP server: {e}");
-                                tracing::error!("HTTP server is now offline - previous server was shut down but new server failed to start");
-                                addr_tx.send(None).ok();
-                            }
-                        }
+                    if current_config != new_config {
+                        current_handle =
+                            handle_config_change(&current_config, &new_config, current_handle, &deps, &addr_tx)
+                                .await;
+                        current_config = new_config;
                     }
-
                 }
             }
         }
 
         // Final shutdown
-        tracing::info!("HTTP server shutting down");
-        current_handle.graceful_shutdown(Some(Duration::from_secs(10)));
-        // Brief delay to allow clean shutdown
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(handle) = current_handle {
+            tracing::info!("HTTP server shutting down");
+            handle.graceful_shutdown(Some(Duration::from_secs(10)));
+            // Brief delay to allow clean shutdown
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         addr_tx.send(None).ok();
     });
 

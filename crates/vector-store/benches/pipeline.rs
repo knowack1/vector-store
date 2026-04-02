@@ -186,7 +186,7 @@ async fn run_vector_store(
     let index_factory = vector_store::new_index_factory_usearch(config.clone()).unwrap();
 
     let addr = config.borrow().vector_store_addr;
-    let (http_tx, http_rx) = watch::channel(Arc::new(HttpServerConfig { addr, tls: None }));
+    let (http_tx, http_rx) = watch::channel(Some(Arc::new(HttpServerConfig { addr, tls: None })));
     let receivers = ConfigReceivers {
         config,
         http: http_rx,
