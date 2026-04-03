@@ -12,6 +12,8 @@ mod distance;
 mod engine;
 mod httproutes;
 mod httpserver;
+pub use httpserver::HttpServer;
+pub use httpserver::HttpServerExt;
 mod index;
 mod index_key;
 mod indexes;
@@ -638,7 +640,7 @@ pub async fn run(
     internals: Sender<Internals>,
     index_factory: Box<dyn IndexFactory + Send + Sync>,
     receivers: ConfigReceivers,
-) -> anyhow::Result<(impl Sized, SocketAddr)> {
+) -> anyhow::Result<Sender<httpserver::HttpServer>> {
     let metrics: Arc<Metrics> = Arc::new(metrics::Metrics::new());
     let index_engine_version = index_factory.index_engine_version();
     httpserver::new(

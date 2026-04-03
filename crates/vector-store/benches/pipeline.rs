@@ -51,6 +51,7 @@ use vector_store::DbIndexType;
 use vector_store::ExpansionAdd;
 use vector_store::ExpansionSearch;
 use vector_store::HttpServerConfig;
+use vector_store::HttpServerExt;
 use vector_store::IndexMetadata;
 use vector_store::PrimaryKey;
 use vector_store::Quantization;
@@ -191,9 +192,10 @@ async fn run_vector_store(
         http: http_rx,
     };
 
-    let (server, addr) = vector_store::run(node_state, db, internals, index_factory, receivers)
+    let server = vector_store::run(node_state, db, internals, index_factory, receivers)
         .await
         .unwrap();
+    let addr = (*server.address().await.borrow()).unwrap();
 
     ((http_tx, server), HttpClient::new(addr))
 }
