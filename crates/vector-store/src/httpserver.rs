@@ -199,15 +199,14 @@ async fn spawn_server(
         let metrics = deps.metrics.clone();
         let internals = deps.internals.clone();
         let index_engine_version = deps.index_engine_version.clone();
-        let tls_config = config
-            .tls
-            .as_ref()
-            .map(|t| RustlsConfig::from_config(Arc::clone(t.server_config())));
+        let tls = config.tls.clone();
 
         async move {
-            let result = match tls_config {
-                Some(tls_config) => {
-                    axum_server_dual_protocol::bind_dual_protocol(addr, tls_config)
+            let result = match tls {
+                Some(ref tls_config) if tls_config.is_mtls() => {
+                    let rustls_config =
+                        RustlsConfig::from_config(Arc::clone(tls_config.server_config()));
+                    axum_server::bind_rustls(addr, rustls_config)
                         .handle(handle)
                         .serve(
                             httproutes::new(
@@ -222,7 +221,25 @@ async fn spawn_server(
                         )
                         .await
                 }
-                _ => {
+                Some(ref tls_config) => {
+                    let rustls_config =
+                        RustlsConfig::from_config(Arc::clone(tls_config.server_config()));
+                    axum_server_dual_protocol::bind_dual_protocol(addr, rustls_config)
+                        .handle(handle)
+                        .serve(
+                            httproutes::new(
+                                engine,
+                                metrics,
+                                state,
+                                internals,
+                                index_engine_version,
+                                true,
+                            )
+                            .into_make_service(),
+                        )
+                        .await
+                }
+                None => {
                     axum_server::bind(addr)
                         .handle(handle)
                         .acceptor(NoDelayAcceptor::new())
