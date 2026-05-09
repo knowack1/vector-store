@@ -279,6 +279,32 @@ pub struct PostIndexAnnResponse {
     pub similarity_scores: Vec<SimilarityScore>,
 }
 
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Request body for full-text search.
+pub struct PostIndexFtsSearchRequest {
+    /// The text query to search for.
+    pub query: String,
+    /// Maximum number of results to return.
+    #[serde(default)]
+    pub limit: Limit,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Response for full-text search.
+pub struct PostIndexFtsSearchResponse {
+    /// The internal primary IDs for matching documents.
+    pub primary_ids: Vec<u64>,
+    /// The relevance scores for each matching document. Higher means more relevant.
+    pub relevance_scores: Vec<RelevanceScore>,
+}
+
+#[derive(
+    Copy, Clone, Debug, serde::Serialize, serde::Deserialize, derive_more::From, utoipa::ToSchema,
+)]
+#[from(f32)]
+/// Relevance score of a full-text search result. Higher score means more relevant.
+pub struct RelevanceScore(f32);
+
 #[derive(
     Copy, Clone, Debug, serde::Serialize, serde::Deserialize, derive_more::From, utoipa::ToSchema,
 )]

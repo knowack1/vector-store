@@ -3,10 +3,12 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+mod actor;
 mod analyzer;
 mod index;
 mod query;
 
+pub(crate) use actor::new;
 pub(crate) use index::FtsIndex;
 
 use crate::Limit;

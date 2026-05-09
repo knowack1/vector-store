@@ -15,6 +15,8 @@ use crate::db::DbExt;
 use crate::db_index::DbIndex;
 use crate::db_index::DbIndexExt;
 use crate::factory::IndexFactory;
+use crate::fts;
+use crate::fts::FtsMessage;
 use crate::index::Index;
 use crate::index::factory::IndexConfiguration;
 use crate::indexes;
@@ -43,6 +45,7 @@ use tracing::trace;
 type GetIndexKeysR = Vec<(IndexKey, Quantization)>;
 type AddIndexR = anyhow::Result<()>;
 type GetIndexR = Option<(mpsc::Sender<Index>, mpsc::Sender<DbIndex>)>;
+type GetFtsIndexR = Option<mpsc::Sender<FtsMessage>>;
 type GetBestIndexR = BestIndexState;
 
 pub(crate) enum Engine {
@@ -66,6 +69,10 @@ pub(crate) enum Engine {
         range_columns: Vec<ColumnName>,
         tx: oneshot::Sender<GetBestIndexR>,
     },
+    GetFtsIndex {
+        key: IndexKey,
+        tx: oneshot::Sender<GetFtsIndexR>,
+    },
 }
 
 pub(crate) trait EngineExt {
@@ -73,6 +80,7 @@ pub(crate) trait EngineExt {
     async fn add_index(&self, metadata: IndexMetadata) -> AddIndexR;
     async fn del_index(&self, key: IndexKey);
     async fn get_index(&self, key: IndexKey) -> GetIndexR;
+    async fn get_fts_index(&self, key: IndexKey) -> GetFtsIndexR;
     async fn get_best_index(
         &self,
         key: IndexKey,
@@ -133,6 +141,15 @@ impl EngineExt for mpsc::Sender<Engine> {
         rx.await
             .expect("EngineExt::get_best_index: internal actor should send response")
     }
+
+    async fn get_fts_index(&self, key: IndexKey) -> GetFtsIndexR {
+        let (tx, rx) = oneshot::channel();
+        self.send(Engine::GetFtsIndex { key, tx })
+            .await
+            .expect("EngineExt::get_fts_index: internal actor should receive request");
+        rx.await
+            .expect("EngineExt::get_fts_index: internal actor should send response")
+    }
 }
 
 pub(crate) async fn new(
@@ -151,7 +168,9 @@ pub(crate) async fn new(
         config_rx.clone(),
     )
     .await?;
-    let memory_actor = memory::new(config_rx);
+    let memory_actor = memory::new(config_rx.clone());
+
+    let fts_config = config_rx;
 
     tokio::spawn(
         async move {
@@ -164,6 +183,7 @@ pub(crate) async fn new(
                     Engine::GetIndexIds { tx } => get_index_keys(tx, &indexes).await,
 
                     Engine::AddIndex { metadata, tx } => {
+                        let fts_enabled = fts_config.borrow().fts_enabled;
                         add_index(
                             metadata,
                             tx,
@@ -173,6 +193,7 @@ pub(crate) async fn new(
                             &mut routing_map,
                             metrics.clone(),
                             memory_actor.clone(),
+                            fts_enabled,
                         )
                         .await
                     }
@@ -200,6 +221,8 @@ pub(crate) async fn new(
                         )
                         .await
                     }
+
+                    Engine::GetFtsIndex { key, tx } => get_fts_index(key, tx, &indexes).await,
                 }
             }
             drop(monitor_actor);
@@ -232,6 +255,7 @@ async fn add_index(
     routing_map: &mut RoutingMap,
     metrics: Arc<Metrics>,
     memory: Sender<Memory>,
+    fts_enabled: bool,
 ) {
     let key = metadata.key();
     if indexes.contains_key(&key) {
@@ -297,11 +321,24 @@ async fn add_index(
         }
     };
 
+    let fts_actor = if fts_enabled {
+        match fts::new(key.clone()) {
+            Ok(actor) => Some(actor),
+            Err(err) => {
+                debug!("unable to create FTS index for {key}: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let monitor_actor = match monitor_items::new(
         key.clone(),
         table,
         embeddings_stream,
         index_actor.clone(),
+        fts_actor.clone(),
         metrics,
     )
     .await
@@ -321,6 +358,7 @@ async fn add_index(
         index_actor,
         monitor_actor,
         db_index,
+        fts_actor,
         primary_key_columns,
         metadata,
     );
@@ -369,6 +407,12 @@ async fn get_best_index(
         .unwrap_or_else(|_| trace!("get_best_index: unable to send response"));
 }
 
+async fn get_fts_index(key: IndexKey, tx: oneshot::Sender<GetFtsIndexR>, indexes: &Indexes) {
+    let result = indexes::get_fts_index(&key, indexes);
+    tx.send(result)
+        .unwrap_or_else(|_| trace!("get_fts_index: unable to send response"));
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -402,6 +446,12 @@ pub(crate) mod tests {
             range_columns: Vec<ColumnName>,
             tx: oneshot::Sender<GetBestIndexR>,
         ) -> impl Future<Output = ()> + Send + 'static;
+
+        fn get_fts_index(
+            &self,
+            key: IndexKey,
+            tx: oneshot::Sender<GetFtsIndexR>,
+        ) -> impl Future<Output = ()> + Send + 'static;
     }
 
     pub(crate) fn new(sim: impl SimEngine + Send + 'static) -> mpsc::Sender<Engine> {
@@ -433,6 +483,7 @@ pub(crate) mod tests {
                             sim.get_best_index(key, equality_columns, range_columns, tx)
                                 .await
                         }
+                        Engine::GetFtsIndex { key, tx } => sim.get_fts_index(key, tx).await,
                     }
                 }
 

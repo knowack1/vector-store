@@ -13,6 +13,7 @@ use crate::db_index::DbIndexExt;
 use crate::distance;
 use crate::engine::Engine;
 use crate::engine::EngineExt;
+use crate::fts::FtsIndexExt;
 use crate::index::IndexExt;
 use crate::index::validator;
 use crate::indexes;
@@ -155,6 +156,7 @@ fn new_open_api_router() -> (Router<RoutesInnerState>, utoipa::openapi::OpenApi)
                 .routes(routes!(get_indexes))
                 .routes(routes!(get_index_status))
                 .routes(routes!(post_index_ann))
+                .routes(routes!(post_index_fts_search))
                 .routes(routes!(get_info))
                 .routes(routes!(get_status)),
         )
@@ -1075,6 +1077,63 @@ async fn get_info(State(state): State<RoutesInnerState>) -> response::Json<httpa
         service: Info::name().to_string(),
         engine: state.index_engine_version.clone(),
     })
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/indexes/{keyspace}/{index}/fts",
+    tag = "scylla-vector-store-index",
+    description = "Performs a full-text search query against the specified index.",
+    params(
+        ("keyspace" = httpapi::KeyspaceName, Path, description = "The keyspace containing the index."),
+        ("index" = httpapi::IndexName, Path, description = "The name of the index to search.")
+    ),
+    request_body = httpapi::PostIndexFtsSearchRequest,
+    responses(
+        (status = 200, description = "Full-text search results.", body = httpapi::PostIndexFtsSearchResponse),
+        (status = 404, description = "Index not found or has no FTS support.", content_type = "application/json", body = ErrorMessage),
+        (status = 500, description = "Internal error during search.", content_type = "application/json", body = ErrorMessage)
+    )
+)]
+async fn post_index_fts_search(
+    State(state): State<RoutesInnerState>,
+    Path((keyspace, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
+    extract::Json(request): extract::Json<httpapi::PostIndexFtsSearchRequest>,
+) -> Response {
+    let keyspace: crate::KeyspaceName = keyspace.into();
+    let index_name: crate::IndexName = index_name.into();
+    let index_key = IndexKey::new(&keyspace, &index_name);
+
+    let Some(fts) = state.engine.get_fts_index(index_key).await else {
+        let msg = format!("missing FTS index: {keyspace}.{index_name}");
+        debug!("post_index_fts_search: {msg}");
+        return (StatusCode::NOT_FOUND, msg).into_response();
+    };
+
+    match fts.search(request.query, request.limit.into()).await {
+        Err(err) => {
+            let msg = format!("FTS search error: {err}");
+            debug!("post_index_fts_search: {msg}");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+        }
+        Ok(results) => {
+            let (primary_ids, relevance_scores): (Vec<u64>, Vec<httpapi::RelevanceScore>) = results
+                .into_iter()
+                .map(|(primary_id, score)| {
+                    (u64::from(primary_id), httpapi::RelevanceScore::from(score))
+                })
+                .unzip();
+
+            (
+                StatusCode::OK,
+                response::Json(httpapi::PostIndexFtsSearchResponse {
+                    primary_ids,
+                    relevance_scores,
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 impl From<crate::node_state::NodeStatus> for httpapi::NodeStatus {

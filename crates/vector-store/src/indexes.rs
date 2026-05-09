@@ -12,6 +12,7 @@ use crate::KeyspaceName;
 use crate::Quantization;
 use crate::TableName;
 use crate::db_index::DbIndex;
+use crate::fts::FtsMessage;
 use crate::index::Index;
 use crate::monitor_items::MonitorItems;
 use crate::node_state::IndexStatus;
@@ -80,6 +81,7 @@ pub(crate) struct IndexEntry {
     pub(crate) index: mpsc::Sender<Index>,
     pub(crate) _monitor: mpsc::Sender<MonitorItems>,
     pub(crate) db_index: mpsc::Sender<DbIndex>,
+    pub(crate) fts: Option<mpsc::Sender<FtsMessage>>,
     pub(crate) routing_group: RoutingGroupKey,
     pub(crate) index_type: DbIndexType,
     pub(crate) filtering_columns: Arc<Vec<ColumnName>>,
@@ -92,6 +94,7 @@ impl IndexEntry {
         index: mpsc::Sender<Index>,
         monitor: mpsc::Sender<MonitorItems>,
         db_index: mpsc::Sender<DbIndex>,
+        fts: Option<mpsc::Sender<FtsMessage>>,
         primary_key_columns: Arc<Vec<ColumnName>>,
         metadata: IndexMetadata,
     ) -> Self {
@@ -108,6 +111,7 @@ impl IndexEntry {
             index,
             _monitor: monitor,
             db_index,
+            fts,
             routing_group,
             index_type: metadata.index_type,
             filtering_columns,
@@ -315,4 +319,12 @@ pub(crate) fn get_index(
 ) -> Option<(mpsc::Sender<Index>, mpsc::Sender<DbIndex>)> {
     let entry = indexes.get(key)?;
     Some((entry.index.clone(), entry.db_index.clone()))
+}
+
+/// Direct FTS index lookup.
+///
+/// Returns the FTS actor sender for the exact key requested, if the index
+/// has FTS enabled.
+pub(crate) fn get_fts_index(key: &IndexKey, indexes: &Indexes) -> Option<mpsc::Sender<FtsMessage>> {
+    indexes.get(key)?.fts.clone()
 }

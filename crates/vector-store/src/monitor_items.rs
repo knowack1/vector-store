@@ -7,6 +7,8 @@ use crate::AsyncInProgress;
 use crate::DbEmbedding;
 use crate::IndexKey;
 use crate::Metrics;
+use crate::fts::FtsIndexExt;
+use crate::fts::FtsMessage;
 use crate::index::Index;
 use crate::index::IndexExt;
 use crate::table::Operation;
@@ -28,6 +30,7 @@ pub(crate) async fn new(
     table: Arc<RwLock<impl TableAdd + Send + Sync + 'static>>,
     mut embeddings: Receiver<(DbEmbedding, Option<AsyncInProgress>)>,
     index: Sender<Index>,
+    fts: Option<Sender<FtsMessage>>,
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<Sender<MonitorItems>> {
     // The value was taken from initial benchmarks
@@ -45,7 +48,7 @@ pub(crate) async fn new(
                         let Some((embedding, in_progress)) = embedding else {
                             break;
                         };
-                        add(&table, &index, embedding, in_progress, &metrics, &key).await;
+                        add(&table, &index, &fts, embedding, in_progress, &metrics, &key).await;
                     }
                     _ = rx.recv() => { }
                 }
@@ -61,6 +64,7 @@ pub(crate) async fn new(
 async fn add(
     table: &Arc<RwLock<impl TableAdd>>,
     index: &Sender<Index>,
+    fts: &Option<Sender<FtsMessage>>,
     embedding: DbEmbedding,
     mut in_progress: Option<AsyncInProgress>,
     metrics: &Metrics,
@@ -115,8 +119,15 @@ async fn add(
             Operation::RemovePartition { partition_id } => {
                 index.remove_partition(partition_id).await;
             }
-            Operation::AddDocument { .. } => {
-                tracing::debug!("AddDocument operation received but FTS actor not yet wired");
+            Operation::AddDocument {
+                primary_id,
+                partition_id,
+                text_content,
+            } => {
+                if let Some(fts) = fts {
+                    fts.add_document(partition_id, primary_id, text_content)
+                        .await;
+                }
             }
         }
     }
@@ -171,6 +182,7 @@ mod tests {
             Arc::clone(&table),
             rx_embeddings,
             tx_index,
+            None,
             metrics,
         )
         .await
@@ -206,6 +218,7 @@ mod tests {
             Arc::clone(&table),
             rx_embeddings,
             tx_index,
+            None,
             Arc::clone(&metrics),
         )
         .await
@@ -266,6 +279,7 @@ mod tests {
             Arc::clone(&table),
             rx_embeddings,
             tx_index,
+            None,
             Arc::clone(&metrics),
         )
         .await
@@ -322,6 +336,7 @@ mod tests {
             Arc::clone(&table),
             rx_embeddings,
             tx_index,
+            None,
             Arc::clone(&metrics),
         )
         .await
@@ -395,6 +410,7 @@ mod tests {
             Arc::clone(&table),
             rx_embeddings,
             tx_index,
+            None,
             Arc::clone(&metrics),
         )
         .await
@@ -493,6 +509,7 @@ mod tests {
             Arc::clone(&table),
             rx_embeddings,
             tx_index,
+            None,
             Arc::clone(&metrics),
         )
         .await
@@ -545,6 +562,7 @@ mod tests {
             Arc::clone(&table),
             rx_embeddings,
             tx_index,
+            None,
             Arc::clone(&metrics),
         )
         .await
