@@ -86,6 +86,7 @@ fn main() -> anyhow::Result<()> {
             vector_store::new_index_factory_usearch(config_rx.clone())?
         };
 
+        tracing::info!("KAROL patch");
         let internals = vector_store::new_internals();
         let db_actor =
             vector_store::new_db(node_state.clone(), internals.clone(), config_rx).await?;

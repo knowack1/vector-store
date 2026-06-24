@@ -1018,11 +1018,18 @@ fn convert_legacy_target_option(
 }
 
 fn db_index_kind_from_options(options: &mut BTreeMap<String, String>) -> Option<DbIndexKind> {
-    match options.remove("kind").as_deref() {
-        Some("vector_index") | None => Some(DbIndexKind::VectorSearch),
-        Some("fulltext_index") => Some(DbIndexKind::FullTextSearch),
+    info!("karol options: {:?}", options);
+    match options.remove("class_name").as_deref() {
+        Some("vector_index") | None => {
+            info!("detected vector_index kind");
+            Some(DbIndexKind::VectorSearch)
+        }
+        Some("fulltext_index") => {
+            info!("detected fulltext_index kind");
+            Some(DbIndexKind::FullTextSearch)
+        }
         Some(unknown) => {
-            debug!("unrecognized index kind: {unknown:?}, skipping index");
+            info!("unrecognized index kind: {unknown:?}, skipping index");
             None
         }
     }

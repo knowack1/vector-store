@@ -179,7 +179,9 @@ impl SchemaVersion {
 
 async fn get_indexes(db: &Sender<Db>) -> anyhow::Result<HashSet<IndexMetadata>> {
     let mut indexes = HashSet::new();
+    info!("get_indexes: starting to fetch indexes");
     for idx in db.get_indexes().await?.into_iter() {
+        info!("get_indexes: processing index {idx:?}");
         let Some(version) = db
             .get_index_version(idx.keyspace.clone(), idx.table.clone(), idx.index.clone())
             .await
@@ -188,15 +190,20 @@ async fn get_indexes(db: &Sender<Db>) -> anyhow::Result<HashSet<IndexMetadata>> 
             debug!("get_indexes: no version for index {idx:?}");
             continue;
         };
+        info!("get_indexes: got version {version:?} for index {}", idx.index);
 
         let kind = match idx.kind {
             DbIndexKind::VectorSearch => {
+                info!("get_indexes: building VectorSearch index kind for {}", idx.index);
                 let Some(kind) = build_vs_index_kind(db, &idx).await? else {
                     continue;
                 };
                 kind
             }
-            DbIndexKind::FullTextSearch => IndexKind::Fts(IndexOptionsFts {}),
+            DbIndexKind::FullTextSearch => {
+                info!("get_indexes: using FullTextSearch index kind for {}", idx.index);
+                IndexKind::Fts(IndexOptionsFts {})
+            }
         };
 
         let metadata = IndexMetadata {
@@ -209,6 +216,7 @@ async fn get_indexes(db: &Sender<Db>) -> anyhow::Result<HashSet<IndexMetadata>> 
             version,
             kind,
         };
+        info!("get_indexes: created metadata for index {}", metadata.key());
 
         if !db.is_valid_index(metadata.clone()).await {
             let msg = format!("get_indexes: not valid index {}", metadata.key());
@@ -216,8 +224,10 @@ async fn get_indexes(db: &Sender<Db>) -> anyhow::Result<HashSet<IndexMetadata>> 
             bail!(msg);
         }
 
+        info!("get_indexes: adding valid index {}", metadata.key());
         indexes.insert(metadata);
     }
+    info!("get_indexes: finished, collected {} indexes", indexes.len());
     Ok(indexes)
 }
 

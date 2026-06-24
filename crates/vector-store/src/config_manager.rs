@@ -446,7 +446,7 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
         )))?;
 
     config.fulltext_indexes = env("VECTOR_STORE_FULLTEXT_INDEXES")
-        .unwrap_or("false".into())
+        .unwrap_or("true".into())
         .trim()
         .parse()
         .or(Err(anyhow!(
