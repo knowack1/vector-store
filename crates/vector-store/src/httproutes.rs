@@ -88,7 +88,7 @@ use utoipa_swagger_ui::SwaggerUi;
             name = "LicenseRef-ScyllaDB-Source-Available-1.0"
         ),
         // version should be updated manually when there are changes in API
-        version = "1.5.0"
+        version = "1.6.0"
     ),
     tags(
         (
@@ -239,8 +239,8 @@ impl From<crate::SimilarityScore> for httpapi::SimilarityScore {
     path = "/api/v1/indexes",
     tag = "scylla-vector-store-index",
     description = "Returns the list of indexes managed by the Vector Store indexing service. \
-    The list includes indexes in any state (initializing, available/built, destroying). \
-    Due to synchronization delays, it may temporarily differ from the list of vector indexes inside ScyllaDB.",
+    The list includes both vector and fulltext indexes in any state (initializing, available/built, destroying). \
+    Due to synchronization delays, it may temporarily differ from the list of indexes inside ScyllaDB.",
     responses(
         (
             status = 200,
@@ -251,7 +251,7 @@ impl From<crate::SimilarityScore> for httpapi::SimilarityScore {
 )]
 
 async fn get_indexes(State(state): State<RoutesInnerState>) -> Response {
-    let indexes: Vec<_> = state
+    let mut indexes: Vec<_> = state
         .engine
         .get_vs_index_keys()
         .await
@@ -262,6 +262,20 @@ async fn get_indexes(State(state): State<RoutesInnerState>) -> Response {
             data_type: vs.quantization.into(),
         })
         .collect();
+
+    let fts_indexes: Vec<_> = state
+        .indexes
+        .read()
+        .unwrap()
+        .iter_fts()
+        .map(|(key, _)| IndexInfo {
+            keyspace: key.keyspace().into(),
+            index: key.index().into(),
+            data_type: httpapi::DataType::Text,
+        })
+        .collect();
+    indexes.extend(fts_indexes);
+
     (StatusCode::OK, response::Json(indexes)).into_response()
 }
 

@@ -6,7 +6,7 @@
     "license": {
       "name": "LicenseRef-ScyllaDB-Source-Available-1.0"
     },
-    "version": "1.5.0"
+    "version": "1.6.0"
   },
   "paths": {
     "/api/v1/indexes": {
@@ -14,7 +14,7 @@
         "tags": [
           "scylla-vector-store-index"
         ],
-        "description": "Returns the list of indexes managed by the Vector Store indexing service. The list includes indexes in any state (initializing, available/built, destroying). Due to synchronization delays, it may temporarily differ from the list of vector indexes inside ScyllaDB.",
+        "description": "Returns the list of indexes managed by the Vector Store indexing service. The list includes both vector and fulltext indexes in any state (initializing, available/built, destroying). Due to synchronization delays, it may temporarily differ from the list of indexes inside ScyllaDB.",
         "operationId": "get_indexes",
         "responses": {
           "200": {
@@ -351,13 +351,14 @@
       },
       "DataType": {
         "type": "string",
-        "description": "Data type and precision used for storing and processing vectors in the index.",
+        "description": "Data type used for storing and processing data in the index.",
         "enum": [
           "F32",
           "F16",
           "BF16",
           "I8",
-          "B1"
+          "B1",
+          "Text"
         ]
       },
       "Distance": {

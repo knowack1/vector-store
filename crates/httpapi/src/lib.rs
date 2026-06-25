@@ -42,18 +42,20 @@ pub struct ColumnName(String);
 pub struct Dimensions(NonZeroUsize);
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
-/// Data type and precision used for storing and processing vectors in the index.
+/// Data type used for storing and processing data in the index.
 pub enum DataType {
-    /// 32-bit single-precision IEEE 754 floating-point.
+    /// 32-bit single-precision IEEE 754 floating-point vector. Vector search index.
     F32,
-    /// 16-bit standard half-precision floating-point (IEEE 754).
+    /// 16-bit half-precision IEEE 754 floating-point vector. Vector search index.
     F16,
-    /// 16-bit "Brain" floating-point.
+    /// 16-bit Brain floating-point (bfloat16) vector. Vector search index.
     BF16,
-    /// 8-bit signed integer.
+    /// 8-bit signed integer quantized vector. Vector search index.
     I8,
-    /// 1-bit binary value (packed 8 per byte).
+    /// 1-bit binary vector (packed 8 per byte). Vector search index.
     B1,
+    /// Text document. Full-text search index.
+    Text,
 }
 
 #[derive(
