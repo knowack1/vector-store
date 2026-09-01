@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 pub(crate) fn new_fts_index_factory_tantivy(
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
+    tuning: crate::FtsTuning,
 ) -> Box<dyn FtsIndexFactory + Send + Sync> {
-    Box::new(TantivyIndexFactory::new(worker, memory))
+    Box::new(TantivyIndexFactory::new(worker, memory, tuning))
 }

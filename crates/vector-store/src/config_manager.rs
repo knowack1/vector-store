@@ -572,6 +572,50 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
         .transpose()?
         .map(|v| v.into());
 
+    // FTS ingest tuning. Absent variables leave the compiled-in defaults, so an
+    // unset environment behaves exactly like a build without these knobs.
+    if let Ok(value) = env("VECTOR_STORE_FTS_COMMIT_INTERVAL") {
+        config.fts_tuning.commit_interval = value.parse::<humantime::Duration>()?.into();
+    }
+    // 0 means "no document-count trigger". Spelling that as usize::MAX here
+    // keeps the comparison at the call site a plain `>=` with no special case.
+    if let Ok(value) = env("VECTOR_STORE_FTS_COMMIT_THRESHOLD") {
+        let threshold = value.parse::<usize>()?;
+        config.fts_tuning.commit_threshold =
+            if threshold == 0 { usize::MAX } else { threshold };
+    }
+    if let Ok(value) = env("VECTOR_STORE_FTS_ADD_LOCK") {
+        config.fts_tuning.shared_add_lock = match value.as_str() {
+            "shared" => true,
+            "exclusive" => false,
+            other => anyhow::bail!(
+                "VECTOR_STORE_FTS_ADD_LOCK must be 'shared' or 'exclusive', got {other:?}"
+            ),
+        };
+    }
+    if let Ok(value) = env("VECTOR_STORE_FTS_METRICS_INTERVAL") {
+        let interval: Duration = value.parse::<humantime::Duration>()?.into();
+        config.fts_tuning.metrics_interval =
+            (!interval.is_zero()).then_some(interval);
+    }
+
+    if let Ok(value) = env("VECTOR_STORE_FTS_WRITER_MEMORY_MB") {
+        let megabytes = value.parse::<usize>()?;
+        // tantivy rejects anything under its minimum, so refuse here with a
+        // message naming the variable rather than failing later inside the
+        // writer where the cause is not visible.
+        anyhow::ensure!(
+            megabytes >= 15,
+            "VECTOR_STORE_FTS_WRITER_MEMORY_MB must be >= 15 (tantivy's minimum), got {megabytes}"
+        );
+        config.fts_tuning.writer_memory_bytes = megabytes * 1_000_000;
+    }
+    if let Ok(value) = env("VECTOR_STORE_FTS_MERGE_THREADS") {
+        let threads = value.parse::<usize>()?;
+        anyhow::ensure!(threads > 0, "VECTOR_STORE_FTS_MERGE_THREADS must be >= 1");
+        config.fts_tuning.merge_threads = threads;
+    }
+
     config.cql_uri_translation_map = env("VECTOR_STORE_CQL_URI_TRANSLATION_MAP")
         .ok()
         .map(|v| serde_json::from_str(&v))

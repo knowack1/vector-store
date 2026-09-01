@@ -176,6 +176,54 @@ impl DiskannAlpha {
     }
 }
 
+/// Runtime tuning for the full-text index ingest path.
+///
+/// Every default reproduces the compiled-in behaviour exactly, so a build with
+/// these knobs is a strict superset of one without them. They exist so the
+/// ingest bottleneck can be located by configuration instead of by rebuilding
+/// once per hypothesis.
+#[derive(Clone, Copy, Debug)]
+pub struct FtsTuning {
+    /// Commit the writer this often.
+    pub commit_interval: Duration,
+    /// Also commit once this many documents are uncommitted. `usize::MAX`
+    /// disables the trigger and leaves `commit_interval` as the only one.
+    pub commit_threshold: usize,
+    /// Take a *shared* lock to add a document instead of an exclusive one.
+    /// Tantivy's `IndexWriter::add_document` takes `&self` and only `commit`
+    /// needs `&mut`, so a shared add lock is sound; exclusive is the historical
+    /// behaviour and stays the default.
+    pub shared_add_lock: bool,
+    /// Emit ingest counters this often. `None` disables them.
+    pub metrics_interval: Option<Duration>,
+    /// Tantivy's per-indexer-thread buffer, in bytes. A thread flushes a
+    /// segment once it has buffered this much. The compiled default is
+    /// tantivy's *minimum* (15 MB), which makes segments small and merges
+    /// frequent; OpenSearch's equivalent (`indices.memory.index_buffer_size`)
+    /// defaults to 10% of heap with a 48 MB floor, so this is the setting on
+    /// which the two engines are least comparable.
+    pub writer_memory_bytes: usize,
+    /// Tantivy's merge thread count. Fixed at 4 by tantivy regardless of the
+    /// CPU quota, which is the leading explanation for the vector-store
+    /// plateauing near 5.5 cores however many it is granted.
+    pub merge_threads: usize,
+}
+
+impl Default for FtsTuning {
+    fn default() -> Self {
+        Self {
+            commit_interval: Duration::from_secs(3),
+            commit_threshold: 10_000,
+            shared_add_lock: false,
+            metrics_interval: None,
+            // tantivy MEMORY_BUDGET_NUM_BYTES_MIN and the IndexWriterOptions
+            // default, so an unset environment reproduces stock exactly.
+            writer_memory_bytes: 15_000_000,
+            merge_threads: 4,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub vector_store_addr: std::net::SocketAddr,
@@ -204,6 +252,7 @@ pub struct Config {
     pub cdc_fine_sleep_interval: Option<Duration>,
     pub monitor_indexes_interval: Option<Duration>,
     pub engine_status_update_interval: Option<Duration>,
+    pub fts_tuning: FtsTuning,
     pub disable_colors: bool,
     pub tls_cert_path: Option<std::path::PathBuf>,
     pub tls_key_path: Option<std::path::PathBuf>,
@@ -227,6 +276,7 @@ impl Default for Config {
             use_diskann: false,
             alter_index_simulator: false,
             fulltext_indexes: true,
+            fts_tuning: FtsTuning::default(),
             disable_colors: false,
             tls_cert_path: None,
             tls_key_path: None,
@@ -760,6 +810,7 @@ pub async fn run(
     let config_rx = config_receivers.config.clone();
     let opensearch_addr = config_rx.borrow().opensearch_addr.clone();
     let use_diskann = config_rx.borrow().use_diskann;
+    let fts_tuning = config_rx.borrow().fts_tuning;
 
     let internals = internals::new();
     let memory = memory::new(internals.clone(), config_rx.clone());
@@ -791,7 +842,8 @@ pub async fn run(
 
     let index_engine_version = vs_index_factory.index_engine_version();
     let indexes = Arc::new(RwLock::new(Indexes::new()));
-    let fts_index_factory = fts_index::new_fts_index_factory_tantivy(worker, memory);
+    let fts_index_factory =
+        fts_index::new_fts_index_factory_tantivy(worker, memory, fts_tuning);
     let engine = engine::new(
         db_actor,
         engine::IndexFactories {

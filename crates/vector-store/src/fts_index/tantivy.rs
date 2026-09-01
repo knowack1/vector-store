@@ -4,9 +4,14 @@
  */
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::RwLock;
+use std::time::Instant;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -37,6 +42,7 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tracing::debug;
 use tracing::error;
+use tracing::info;
 
 use crate::AsyncInProgress;
 use crate::IndexKey;
@@ -62,11 +68,20 @@ use super::actor::FtsStatsR;
 pub(crate) struct TantivyIndexFactory {
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
+    tuning: crate::FtsTuning,
 }
 
 impl TantivyIndexFactory {
-    pub(crate) fn new(worker: async_channel::Sender<Worker>, memory: mpsc::Sender<Memory>) -> Self {
-        Self { worker, memory }
+    pub(crate) fn new(
+        worker: async_channel::Sender<Worker>,
+        memory: mpsc::Sender<Memory>,
+        tuning: crate::FtsTuning,
+    ) -> Self {
+        Self {
+            worker,
+            memory,
+            tuning,
+        }
     }
 }
 
@@ -77,8 +92,9 @@ impl FtsIndexFactory for TantivyIndexFactory {
             table,
             self.worker.clone(),
             self.memory.clone(),
-            COMMIT_INTERVAL,
-            MAX_UNCOMMITTED_THRESHOLD,
+            self.tuning.commit_interval,
+            self.tuning.commit_threshold,
+            self.tuning,
         )
     }
 }
@@ -88,39 +104,55 @@ struct Writer {
     // In-progress guards for documents written to the writer but not yet committed. They are held
     // here so the index is not reported as caught up (SERVING) until the commit that makes those
     // documents searchable has succeeded.
-    uncommitted_docs_in_progress_guards: Vec<AsyncInProgress>,
+    //
+    // Behind their own Mutex rather than inline: pushing to a Vec is the only
+    // reason adding a document ever needed `&mut self`, and that forced every
+    // add to take the *exclusive* side of the outer RwLock even though
+    // `IndexWriter::add_document` takes `&self`. With the guards separated, an
+    // add needs only a shared outer lock and a brief hold on this one, while
+    // `commit` still takes the exclusive side because `IndexWriter::commit`
+    // takes `&mut self`.
+    uncommitted_docs_in_progress_guards: Mutex<Vec<AsyncInProgress>>,
 }
 
 impl Writer {
     fn add_document(
-        &mut self,
+        &self,
         doc: TantivyDocument,
         in_progress: AsyncInProgress,
     ) -> tantivy::Result<usize> {
         self.writer.add_document(doc)?;
-        self.uncommitted_docs_in_progress_guards.push(in_progress);
-        Ok(self.uncommitted_docs())
+        Ok(self.retain_guard(in_progress))
     }
 
-    fn rm_document(&mut self, term: tantivy::Term, in_progress: AsyncInProgress) -> usize {
+    fn rm_document(&self, term: tantivy::Term, in_progress: AsyncInProgress) -> usize {
         self.writer.delete_term(term);
-        self.uncommitted_docs_in_progress_guards.push(in_progress);
-        self.uncommitted_docs()
+        self.retain_guard(in_progress)
     }
 
-    fn commit(&mut self, reload: impl FnOnce() -> tantivy::Result<()>) -> tantivy::Result<()> {
+    fn retain_guard(&self, in_progress: AsyncInProgress) -> usize {
+        let mut guards = self.uncommitted_docs_in_progress_guards.lock().unwrap();
+        guards.push(in_progress);
+        guards.len()
+    }
+
+    fn commit(&mut self, reload: impl FnOnce() -> tantivy::Result<()>) -> tantivy::Result<usize> {
+        let committed = self.uncommitted_docs();
         self.writer.commit()?;
         reload()?;
-        self.uncommitted_docs_in_progress_guards.clear();
-        Ok(())
+        self.uncommitted_docs_in_progress_guards
+            .lock()
+            .unwrap()
+            .clear();
+        Ok(committed)
     }
 
     fn uncommitted_docs(&self) -> usize {
-        self.uncommitted_docs_in_progress_guards.len()
+        self.uncommitted_docs_in_progress_guards.lock().unwrap().len()
     }
 
     fn has_uncommitted_docs(&self) -> bool {
-        !self.uncommitted_docs_in_progress_guards.is_empty()
+        self.uncommitted_docs() > 0
     }
 }
 
@@ -131,19 +163,63 @@ struct IndexState {
     schema: Schema,
 }
 
+/// Ingest counters, so the bottleneck is measured rather than inferred.
+///
+/// `received` is documents arriving at the actor from CDC; `added` is documents
+/// handed to the Tantivy writer; `add_lock_wait_nanos` is time spent blocked
+/// acquiring the writer lock. If `received` tracks `added` and both sit at the
+/// observed throughput, the delivery path upstream is the limit. If `received`
+/// runs far ahead of `added`, or `add_lock_wait_nanos` dominates, the writer
+/// path is.
+#[derive(Default)]
+struct IngestMetrics {
+    received: AtomicU64,
+    added: AtomicU64,
+    add_lock_wait_nanos: AtomicU64,
+    commits: AtomicU64,
+    committed_docs: AtomicU64,
+}
+
+impl IngestMetrics {
+    fn snapshot(&self) -> [u64; 5] {
+        [
+            self.received.load(Ordering::Relaxed),
+            self.added.load(Ordering::Relaxed),
+            self.add_lock_wait_nanos.load(Ordering::Relaxed),
+            self.commits.load(Ordering::Relaxed),
+            self.committed_docs.load(Ordering::Relaxed),
+        ]
+    }
+}
+
 const TOKENIZER_NAME: &str = "standard";
-const COMMIT_INTERVAL: Duration = Duration::from_secs(3);
-const MAX_UNCOMMITTED_THRESHOLD: usize = 10_000;
 
 impl IndexState {
-    fn new() -> anyhow::Result<Self> {
+    fn new(tuning: crate::FtsTuning) -> anyhow::Result<Self> {
         let schema = build_schema();
         let index = tantivy::Index::create_in_ram(schema.clone());
         index
             .tokenizers()
             .register(TOKENIZER_NAME, build_standard_analyzer()?);
+        let worker_threads = perf::num_workers();
+        // The index build is the one place where a wrong thread count is
+        // invisible in the result but decisive for it: too few and the build is
+        // serialised behind the runtime's worker count rather than the CPU
+        // budget the container was actually given.
+        info!(
+            "fts: index writer using {worker_threads} tantivy worker threads, \
+             {} MB buffer per thread, {} merge threads \
+             (tokio workers={worker_threads}, available_parallelism={})",
+            tuning.writer_memory_bytes / 1_000_000,
+            tuning.merge_threads,
+            std::thread::available_parallelism()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        );
         let options = IndexWriterOptions::builder()
-            .num_worker_threads(perf::num_workers().into())
+            .num_worker_threads(worker_threads.into())
+            .memory_budget_per_thread(tuning.writer_memory_bytes)
+            .num_merge_threads(tuning.merge_threads)
             .build();
         let writer = index
             .writer_with_options(options)
@@ -157,7 +233,7 @@ impl IndexState {
             index,
             writer: RwLock::new(Writer {
                 writer,
-                uncommitted_docs_in_progress_guards: Vec::new(),
+                uncommitted_docs_in_progress_guards: Mutex::new(Vec::new()),
             }),
             reader,
             schema,
@@ -198,32 +274,97 @@ fn create_doc(schema: &Schema, primary_id: PrimaryId, document: &str) -> Tantivy
     doc
 }
 
-fn commit(state: &IndexState, key: &IndexKey) {
+#[derive(Clone, Copy)]
+enum CommitTrigger {
+    Interval,
+    Threshold,
+}
+
+impl fmt::Display for CommitTrigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            CommitTrigger::Interval => "interval",
+            CommitTrigger::Threshold => "threshold",
+        })
+    }
+}
+
+fn commit(state: &IndexState, key: &IndexKey, trigger: CommitTrigger,
+          metrics: &IngestMetrics) {
+    let started = Instant::now();
     let result = state
         .writer
         .write()
         .unwrap()
         .commit(|| state.reader.reload());
-    if let Err(err) = result {
-        error!("fts: failed to commit for {key}: {err}");
+    match result {
+        // The trigger and the batch size are the whole point of this line: they
+        // are what distinguishes an interval-paced commit cadence from one that
+        // is really being driven by the document threshold.
+        Ok(committed) => {
+            metrics.commits.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .committed_docs
+                .fetch_add(committed as u64, Ordering::Relaxed);
+            info!(
+                "fts: committed {committed} docs for {key} on {trigger} trigger in {:?}",
+                started.elapsed()
+            )
+        }
+        Err(err) => error!("fts: failed to commit for {key}: {err}"),
     }
+}
+
+/// Runs `op` against the writer under the configured lock mode, charging the
+/// time spent waiting for the lock to the metrics.
+///
+/// `shared` is the interesting case: `IndexWriter::add_document` takes `&self`,
+/// so nothing about adding a document requires excluding other adders. Only
+/// `commit` does, and it takes the write side separately.
+fn with_writer<T>(
+    state: &IndexState,
+    metrics: &IngestMetrics,
+    shared: bool,
+    op: impl FnOnce(&Writer) -> T,
+) -> T {
+    let waiting = Instant::now();
+    let result = if shared {
+        let writer = state.writer.read().unwrap();
+        metrics
+            .add_lock_wait_nanos
+            .fetch_add(waiting.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        op(&writer)
+    } else {
+        let writer = state.writer.write().unwrap();
+        metrics
+            .add_lock_wait_nanos
+            .fetch_add(waiting.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        op(&writer)
+    };
+    result
 }
 
 fn handle_add_document(
     state: &IndexState,
+    metrics: &IngestMetrics,
+    shared: bool,
     primary_id: PrimaryId,
     document: String,
     in_progress: AsyncInProgress,
 ) -> usize {
     let doc = create_doc(&state.schema, primary_id, &document);
-    let mut writer = state.writer.write().unwrap();
-    match writer.add_document(doc, in_progress) {
-        Ok(pending) => pending,
-        Err(err) => {
-            error!("fts: failed to add document {primary_id:?}: {err}");
-            writer.uncommitted_docs()
+    with_writer(state, metrics, shared, |writer| {
+        match writer.add_document(doc, in_progress) {
+            Ok(pending) => {
+                metrics.added.fetch_add(1, Ordering::Relaxed);
+                pending
+            }
+            Err(err) => {
+                error!("fts: failed to add document {primary_id:?}: {err}");
+                writer.uncommitted_docs()
+            }
         }
-    }
+    })
 }
 
 fn create_term(schema: &Schema, primary_id: PrimaryId) -> tantivy::Term {
@@ -233,11 +374,15 @@ fn create_term(schema: &Schema, primary_id: PrimaryId) -> tantivy::Term {
 
 fn handle_remove_document(
     state: &IndexState,
+    metrics: &IngestMetrics,
+    shared: bool,
     primary_id: PrimaryId,
     in_progress: AsyncInProgress,
 ) -> usize {
     let term = create_term(&state.schema, primary_id);
-    state.writer.write().unwrap().rm_document(term, in_progress)
+    with_writer(state, metrics, shared, |writer| {
+        writer.rm_document(term, in_progress)
+    })
 }
 
 /// A query-related failure caused by the caller's input (an unparsable query, or a query
@@ -392,12 +537,13 @@ fn get_or_create_state<T: TableSearch>(
     states: &mut BTreeMap<IndexId, Arc<IndexState>>,
     table: &RwLock<T>,
     key: &IndexKey,
+    tuning: crate::FtsTuning,
 ) -> Option<Arc<IndexState>> {
     let index_id = table.read().unwrap().index_id(key)?;
     if let Some(state) = states.get(&index_id) {
         return Some(Arc::clone(state));
     }
-    match IndexState::new() {
+    match IndexState::new(tuning) {
         Ok(state) => {
             let state = Arc::new(state);
             states.insert(index_id, Arc::clone(&state));
@@ -443,6 +589,7 @@ pub(crate) fn new(
     memory: mpsc::Sender<Memory>,
     commit_interval: Duration,
     commit_threshold: usize,
+    tuning: crate::FtsTuning,
 ) -> mpsc::Sender<FtsIndex> {
     let (tx, mut rx) = mpsc::channel::<FtsIndex>(perf::channel_size().into());
     tokio::spawn(async move {
@@ -454,6 +601,24 @@ pub(crate) fn new(
 
         let mut interval = tokio::time::interval(commit_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let metrics = Arc::new(IngestMetrics::default());
+        let shared_add = tuning.shared_add_lock;
+        info!(
+            "fts: ingest tuning for {key}: commit_interval={:?} commit_threshold={} \
+             add_lock={} metrics_interval={:?}",
+            commit_interval,
+            if commit_threshold == usize::MAX {
+                "disabled".to_string()
+            } else {
+                commit_threshold.to_string()
+            },
+            if shared_add { "shared" } else { "exclusive" },
+            tuning.metrics_interval,
+        );
+        if let Some(period) = tuning.metrics_interval {
+            spawn_metrics_reporter(key.clone(), Arc::clone(&metrics), period);
+        }
 
         loop {
             tokio::select! {
@@ -467,10 +632,12 @@ pub(crate) fn new(
                             document,
                             in_progress,
                         } => {
+                            metrics.received.fetch_add(1, Ordering::Relaxed);
                             let Some(state) = get_or_create_state(
                                 &mut states,
                                 table.as_ref(),
                                 &key,
+                                tuning,
                             ) else {
                                 continue;
                             };
@@ -478,16 +645,24 @@ pub(crate) fn new(
                                 continue;
                             }
                             let key = key.clone();
+                            let metrics = Arc::clone(&metrics);
                             worker
                                 .spawn_blocking(move || {
                                     let pending = handle_add_document(
                                         &state,
+                                        &metrics,
+                                        shared_add,
                                         primary_id,
                                         document,
                                         in_progress,
                                     );
                                     if pending >= commit_threshold {
-                                        commit(&state, &key);
+                                        commit(
+                                            &state,
+                                            &key,
+                                            CommitTrigger::Threshold,
+                                            &metrics,
+                                        );
                                     }
                                 })
                                 .await;
@@ -500,16 +675,28 @@ pub(crate) fn new(
                                 &mut states,
                                 table.as_ref(),
                                 &key,
+                                tuning,
                             ) else {
                                 continue;
                             };
                             let key = key.clone();
+                            let metrics = Arc::clone(&metrics);
                             worker
                                 .spawn_blocking(move || {
-                                    let pending =
-                                        handle_remove_document(&state, primary_id, in_progress);
+                                    let pending = handle_remove_document(
+                                        &state,
+                                        &metrics,
+                                        shared_add,
+                                        primary_id,
+                                        in_progress,
+                                    );
                                     if pending >= commit_threshold {
-                                        commit(&state, &key);
+                                        commit(
+                                            &state,
+                                            &key,
+                                            CommitTrigger::Threshold,
+                                            &metrics,
+                                        );
                                     }
                                 })
                                 .await;
@@ -584,7 +771,12 @@ pub(crate) fn new(
                         }
                         let state = Arc::clone(state);
                         let key = key.clone();
-                        worker.spawn_blocking(move || commit(&state, &key)).await;
+                        let metrics = Arc::clone(&metrics);
+                        worker
+                            .spawn_blocking(move || {
+                                commit(&state, &key, CommitTrigger::Interval, &metrics)
+                            })
+                            .await;
                     }
                 }
             }
@@ -592,6 +784,41 @@ pub(crate) fn new(
         debug!("fts index actor finished for {key}");
     });
     tx
+}
+
+/// Logs ingest counters as rates over each period.
+///
+/// Rates rather than totals because the question is where throughput is lost,
+/// and a total cannot distinguish "delivery is slow" from "delivery stopped".
+fn spawn_metrics_reporter(key: IndexKey, metrics: Arc<IngestMetrics>, period: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut previous = metrics.snapshot();
+        loop {
+            ticker.tick().await;
+            let current = metrics.snapshot();
+            let delta: Vec<u64> = current
+                .iter()
+                .zip(previous.iter())
+                .map(|(now, before)| now.saturating_sub(*before))
+                .collect();
+            let seconds = period.as_secs_f64();
+            info!(
+                "fts metrics {key}: received={:.0}/s added={:.0}/s \
+                 lock_wait={:.1}ms/s commits={} committed={:.0}/s \
+                 (totals received={} added={})",
+                delta[0] as f64 / seconds,
+                delta[1] as f64 / seconds,
+                delta[2] as f64 / 1e6 / seconds,
+                delta[3],
+                delta[4] as f64 / seconds,
+                current[0],
+                current[1],
+            );
+            previous = current;
+        }
+    });
 }
 
 #[cfg(test)]
@@ -646,6 +873,21 @@ mod tests {
     }
 
     const TEST_COMMIT_INTERVAL: Duration = Duration::from_millis(50);
+
+    fn test_tuning(interval: Duration, threshold: usize) -> crate::FtsTuning {
+        crate::FtsTuning {
+            commit_interval: interval,
+            commit_threshold: threshold,
+            shared_add_lock: SHARED_ADD_LOCK_UNDER_TEST,
+            metrics_interval: None,
+            ..crate::FtsTuning::default()
+        }
+    }
+
+    // Flipped to exercise the other lock mode; both must pass, since the mode is
+    // selectable at runtime and a mode that is never tested is a mode that will
+    // break silently.
+    const SHARED_ADD_LOCK_UNDER_TEST: bool = false;
     const TEST_COMMIT_THRESHOLD: usize = 3;
 
     fn make_sender(table: Arc<RwLock<MockTableSearch>>) -> mpsc::Sender<FtsIndex> {
@@ -658,6 +900,7 @@ mod tests {
             memory,
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
+            test_tuning(TEST_COMMIT_INTERVAL, TEST_COMMIT_THRESHOLD),
         )
     }
 
@@ -888,6 +1131,7 @@ mod tests {
             memory,
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
+            test_tuning(TEST_COMMIT_INTERVAL, TEST_COMMIT_THRESHOLD),
         );
 
         add_doc(&sender, 1, "should not be indexed").await;
@@ -911,6 +1155,7 @@ mod tests {
             memory,
             Duration::from_secs(3600),
             TEST_COMMIT_THRESHOLD,
+            test_tuning(Duration::from_secs(3600), TEST_COMMIT_THRESHOLD),
         );
         let (tx, mut rx) = mpsc::channel(1);
 
