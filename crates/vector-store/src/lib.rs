@@ -207,6 +207,18 @@ pub struct FtsTuning {
     /// CPU quota, which is the leading explanation for the vector-store
     /// plateauing near 5.5 cores however many it is granted.
     pub merge_threads: usize,
+    /// Run the per-document index work on the FTS actor's own task instead of
+    /// dispatching it through the shared worker pool.
+    ///
+    /// The pooled path costs a boxed closure, an `async_channel` round trip and
+    /// two in-flight atomics per document, and once every worker is busy —
+    /// which is the whole of a saturating build — `worker::try_acquire_thread`
+    /// bounces one operation onto a single dedicated current-thread runtime and
+    /// awaits it, admitting only one such bounce at a time. That is a
+    /// serialisation point, not parallelism. What it protects is cheap:
+    /// building the document does not tokenize, and `IndexWriter::add_document`
+    /// only pushes onto tantivy's queue for its own indexing threads.
+    pub inline_ingest: bool,
 }
 
 impl Default for FtsTuning {
@@ -220,6 +232,7 @@ impl Default for FtsTuning {
             // default, so an unset environment reproduces stock exactly.
             writer_memory_bytes: 15_000_000,
             merge_threads: 4,
+            inline_ingest: false,
         }
     }
 }

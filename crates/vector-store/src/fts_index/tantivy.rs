@@ -315,6 +315,26 @@ fn commit(state: &IndexState, key: &IndexKey, trigger: CommitTrigger,
     }
 }
 
+/// Runs one unit of index work, either on the actor's own task or through the
+/// shared worker pool.
+///
+/// See `FtsTuning::inline_ingest` for why the pooled path is worth avoiding:
+/// per document it costs a boxed closure, an `async_channel` round trip and two
+/// in-flight atomics, and once every worker is busy — which is the whole of a
+/// saturating build — `worker::try_acquire_thread` funnels one operation at a
+/// time onto a single dedicated runtime.
+async fn dispatch(
+    worker: &async_channel::Sender<Worker>,
+    inline: bool,
+    f: impl FnOnce() + Send + 'static,
+) {
+    if inline {
+        f();
+    } else {
+        worker.spawn_blocking(f).await;
+    }
+}
+
 /// Runs `op` against the writer under the configured lock mode, charging the
 /// time spent waiting for the lock to the metrics.
 ///
@@ -604,9 +624,10 @@ pub(crate) fn new(
 
         let metrics = Arc::new(IngestMetrics::default());
         let shared_add = tuning.shared_add_lock;
+        let inline_ingest = tuning.inline_ingest;
         info!(
             "fts: ingest tuning for {key}: commit_interval={:?} commit_threshold={} \
-             add_lock={} metrics_interval={:?}",
+             add_lock={} dispatch={} metrics_interval={:?}",
             commit_interval,
             if commit_threshold == usize::MAX {
                 "disabled".to_string()
@@ -614,6 +635,7 @@ pub(crate) fn new(
                 commit_threshold.to_string()
             },
             if shared_add { "shared" } else { "exclusive" },
+            if inline_ingest { "inline" } else { "worker-pool" },
             tuning.metrics_interval,
         );
         if let Some(period) = tuning.metrics_interval {
@@ -646,8 +668,7 @@ pub(crate) fn new(
                             }
                             let key = key.clone();
                             let metrics = Arc::clone(&metrics);
-                            worker
-                                .spawn_blocking(move || {
+                            dispatch(&worker, inline_ingest, move || {
                                     let pending = handle_add_document(
                                         &state,
                                         &metrics,
@@ -681,8 +702,7 @@ pub(crate) fn new(
                             };
                             let key = key.clone();
                             let metrics = Arc::clone(&metrics);
-                            worker
-                                .spawn_blocking(move || {
+                            dispatch(&worker, inline_ingest, move || {
                                     let pending = handle_remove_document(
                                         &state,
                                         &metrics,
@@ -718,8 +738,7 @@ pub(crate) fn new(
                                 continue;
                             };
                             let table = Arc::clone(&table);
-                            worker
-                                .spawn_blocking(move || {
+                            dispatch(&worker, inline_ingest, move || {
                                     let result = handle_search(
                                         &state,
                                         table.as_ref(),
@@ -742,8 +761,7 @@ pub(crate) fn new(
                                 _ = tx.send(Err(anyhow!("fts: missing index {index_key}")));
                                 continue;
                             };
-                            worker
-                                .spawn_blocking(move || {
+                            dispatch(&worker, inline_ingest, move || {
                                     let result = handle_highlight(&state, &query, &documents);
                                     _ = tx.send(result);
                                 })
@@ -755,8 +773,7 @@ pub(crate) fn new(
                                 _ = tx.send(Ok(FtsStats::default()));
                                 continue;
                             };
-                            worker
-                                .spawn_blocking(move || {
+                            dispatch(&worker, inline_ingest, move || {
                                     let result = handle_stats(&state);
                                     _ = tx.send(result);
                                 })
@@ -772,8 +789,7 @@ pub(crate) fn new(
                         let state = Arc::clone(state);
                         let key = key.clone();
                         let metrics = Arc::clone(&metrics);
-                        worker
-                            .spawn_blocking(move || {
+                        dispatch(&worker, inline_ingest, move || {
                                 commit(&state, &key, CommitTrigger::Interval, &metrics)
                             })
                             .await;
@@ -891,6 +907,13 @@ mod tests {
     const TEST_COMMIT_THRESHOLD: usize = 3;
 
     fn make_sender(table: Arc<RwLock<MockTableSearch>>) -> mpsc::Sender<FtsIndex> {
+        make_sender_with(table, test_tuning(TEST_COMMIT_INTERVAL, TEST_COMMIT_THRESHOLD))
+    }
+
+    fn make_sender_with(
+        table: Arc<RwLock<MockTableSearch>>,
+        tuning: crate::FtsTuning,
+    ) -> mpsc::Sender<FtsIndex> {
         let key = make_index_key();
         let memory = make_memory_actor();
         new(
@@ -898,10 +921,17 @@ mod tests {
             table,
             worker::new(),
             memory,
-            TEST_COMMIT_INTERVAL,
-            TEST_COMMIT_THRESHOLD,
-            test_tuning(TEST_COMMIT_INTERVAL, TEST_COMMIT_THRESHOLD),
+            tuning.commit_interval,
+            tuning.commit_threshold,
+            tuning,
         )
+    }
+
+    fn inline_tuning() -> crate::FtsTuning {
+        crate::FtsTuning {
+            inline_ingest: true,
+            ..test_tuning(TEST_COMMIT_INTERVAL, TEST_COMMIT_THRESHOLD)
+        }
     }
 
     async fn add_doc(sender: &mpsc::Sender<FtsIndex>, primary: u64, content: &str) {
@@ -965,6 +995,49 @@ mod tests {
         let count = sender.count(key).await.unwrap();
 
         assert_eq!(count, 2);
+    }
+
+    // The dispatch mode is selectable at runtime, so the inline path needs its
+    // own coverage for the same reason the add-lock mode does: a path that is
+    // never tested is a path that will break silently. These assert that
+    // bypassing the worker pool still indexes, still removes, and still commits
+    // on the interval tick.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn inline_dispatch_indexes_and_removes_documents() {
+        let table = make_table_with_keys();
+        let sender = make_sender_with(table, inline_tuning());
+
+        add_doc(&sender, 1, "hello world").await;
+        add_doc(&sender, 2, "foo bar").await;
+        rm_doc(&sender, 2).await;
+
+        let count = sender.count(make_index_key()).await.unwrap();
+
+        assert_eq!(count, 1);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn inline_dispatch_serves_search() {
+        let table = make_table_with_keys();
+        let sender = make_sender_with(table, inline_tuning());
+
+        add_doc(&sender, 1, "hello world").await;
+
+        let (keys, scores) = sender
+            .search(
+                make_index_key(),
+                "hello".into(),
+                Limit::from(std::num::NonZeroUsize::new(10).unwrap()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(scores.len(), 1);
     }
 
     #[rstest]

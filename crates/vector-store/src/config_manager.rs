@@ -615,6 +615,15 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
         anyhow::ensure!(threads > 0, "VECTOR_STORE_FTS_MERGE_THREADS must be >= 1");
         config.fts_tuning.merge_threads = threads;
     }
+    if let Ok(value) = env("VECTOR_STORE_FTS_INLINE_INGEST") {
+        config.fts_tuning.inline_ingest = match value.as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            other => anyhow::bail!(
+                "VECTOR_STORE_FTS_INLINE_INGEST must be '1'/'true' or '0'/'false', got {other:?}"
+            ),
+        };
+    }
 
     config.cql_uri_translation_map = env("VECTOR_STORE_CQL_URI_TRANSLATION_MAP")
         .ok()
