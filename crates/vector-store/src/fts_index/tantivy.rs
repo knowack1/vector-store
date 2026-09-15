@@ -6,6 +6,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Deref;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -43,6 +45,7 @@ use tokio::sync::watch;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 
 use crate::AsyncInProgress;
 use crate::IndexKey;
@@ -94,7 +97,7 @@ impl FtsIndexFactory for TantivyIndexFactory {
             self.memory.clone(),
             self.tuning.commit_interval,
             self.tuning.commit_threshold,
-            self.tuning,
+            self.tuning.clone(),
         )
     }
 }
@@ -156,11 +159,108 @@ impl Writer {
     }
 }
 
+/// Owns the on-disk scratch directory of one index and removes it on drop.
+///
+/// Kept as a separate type so the removal is tied to a value whose drop order
+/// is explicit: it is the last field of `IndexState`, so the writer, the reader
+/// and the index -- and with them every mmap and tantivy's writer lock file --
+/// are dropped before the tree goes away.
+struct IndexDir(PathBuf);
+
+impl Drop for IndexDir {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => info!("fts: removed index dir {}", self.0.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            // Scratch: the next run wipes this same path before using it, so a
+            // failure here leaks disk rather than corrupting anything.
+            Err(err) => warn!(
+                "fts: failed to remove index dir {}: {err}",
+                self.0.display()
+            ),
+        }
+    }
+}
+
+/// Directory name for one index under the configured root.
+///
+/// The index key is what disambiguates, not the id: `IndexIdGenerator` is per
+/// table, so the first index of every table is given the same `IndexId` and two
+/// indexes in one process would otherwise share -- and then wipe -- a single
+/// directory. The id is kept so a directory traces back to a state-map entry.
+///
+/// The dot separating keyspace from index is sanitized away with everything
+/// else that is not alphanumeric: a name of only dots would be `.` or `..`, and
+/// the whole point of this function is that its result can never be anything
+/// but a single, ordinary directory name directly under the configured root.
+fn index_dir_name(key: &IndexKey, index_id: IndexId) -> String {
+    let sanitized: String = key
+        .to_string()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let id: u16 = *index_id.as_ref();
+    format!("{sanitized}-{id}")
+}
+
+fn create_index(
+    key: &IndexKey,
+    index_id: IndexId,
+    schema: Schema,
+    index_dir: Option<&Path>,
+) -> anyhow::Result<(tantivy::Index, Option<IndexDir>)> {
+    let Some(root) = index_dir else {
+        return Ok((tantivy::Index::create_in_ram(schema), None));
+    };
+    let path = root.join(index_dir_name(key, index_id));
+    clear_index_dir(&path)?;
+    std::fs::create_dir_all(&path)
+        .map_err(|err| anyhow!("fts: failed to create index dir {}: {err}", path.display()))?;
+    let index = tantivy::Index::create_in_dir(&path, schema)
+        .map_err(|err| anyhow!("fts: failed to create index in {}: {err}", path.display()))?;
+    info!(
+        "fts: index for {key} on disk at {} -- scratch only: wiped at create, \
+         removed on drop, never reopened. Index pages are file-backed from here \
+         on, so they are not anonymous memory and the allocation gate behind \
+         VECTOR_STORE_MEMORY_LIMIT does not see them growing.",
+        path.display()
+    );
+    Ok((index, Some(IndexDir(path))))
+}
+
+/// Remove whatever is at the index's path before building there.
+///
+/// Two reasons, and either one alone would be enough: `create_in_dir` refuses a
+/// directory that already holds an index, and segments left behind by a killed
+/// run must never become reachable by a query.
+fn clear_index_dir(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {
+            info!("fts: cleared pre-existing index dir {}", path.display());
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(anyhow!(
+            "fts: failed to clear index dir {}: {err}",
+            path.display()
+        )),
+    }
+}
+
 struct IndexState {
     index: tantivy::Index,
     writer: RwLock<Writer>,
     reader: tantivy::IndexReader,
     schema: Schema,
+    /// Last field on purpose: fields drop in declaration order, so the mmaps and
+    /// the writer lock are gone before the directory is removed.
+    _dir: Option<IndexDir>,
 }
 
 /// Ingest counters, so the bottleneck is measured rather than inferred.
@@ -195,9 +295,10 @@ impl IngestMetrics {
 const TOKENIZER_NAME: &str = "standard";
 
 impl IndexState {
-    fn new(tuning: crate::FtsTuning) -> anyhow::Result<Self> {
+    fn new(key: &IndexKey, index_id: IndexId, tuning: &crate::FtsTuning) -> anyhow::Result<Self> {
         let schema = build_schema();
-        let index = tantivy::Index::create_in_ram(schema.clone());
+        let (index, dir) =
+            create_index(key, index_id, schema.clone(), tuning.index_dir.as_deref())?;
         index
             .tokenizers()
             .register(TOKENIZER_NAME, build_standard_analyzer()?);
@@ -237,6 +338,7 @@ impl IndexState {
             }),
             reader,
             schema,
+            _dir: dir,
         })
     }
 }
@@ -557,13 +659,13 @@ fn get_or_create_state<T: TableSearch>(
     states: &mut BTreeMap<IndexId, Arc<IndexState>>,
     table: &RwLock<T>,
     key: &IndexKey,
-    tuning: crate::FtsTuning,
+    tuning: &crate::FtsTuning,
 ) -> Option<Arc<IndexState>> {
     let index_id = table.read().unwrap().index_id(key)?;
     if let Some(state) = states.get(&index_id) {
         return Some(Arc::clone(state));
     }
-    match IndexState::new(tuning) {
+    match IndexState::new(key, index_id, tuning) {
         Ok(state) => {
             let state = Arc::new(state);
             states.insert(index_id, Arc::clone(&state));
@@ -627,7 +729,7 @@ pub(crate) fn new(
         let inline_ingest = tuning.inline_ingest;
         info!(
             "fts: ingest tuning for {key}: commit_interval={:?} commit_threshold={} \
-             add_lock={} dispatch={} metrics_interval={:?}",
+             add_lock={} dispatch={} metrics_interval={:?} index={}",
             commit_interval,
             if commit_threshold == usize::MAX {
                 "disabled".to_string()
@@ -637,6 +739,10 @@ pub(crate) fn new(
             if shared_add { "shared" } else { "exclusive" },
             if inline_ingest { "inline" } else { "worker-pool" },
             tuning.metrics_interval,
+            match tuning.index_dir.as_deref() {
+                None => "ram".to_string(),
+                Some(root) => format!("disk:{}", root.display()),
+            },
         );
         if let Some(period) = tuning.metrics_interval {
             spawn_metrics_reporter(key.clone(), Arc::clone(&metrics), period);
@@ -659,7 +765,7 @@ pub(crate) fn new(
                                 &mut states,
                                 table.as_ref(),
                                 &key,
-                                tuning,
+                                &tuning,
                             ) else {
                                 continue;
                             };
@@ -696,7 +802,7 @@ pub(crate) fn new(
                                 &mut states,
                                 table.as_ref(),
                                 &key,
-                                tuning,
+                                &tuning,
                             ) else {
                                 continue;
                             };
@@ -850,6 +956,7 @@ mod tests {
     use rstest::rstest;
     use scylla::value::CqlValue;
     use std::time::Duration;
+    use tempfile::TempDir;
 
     use super::super::actor::FtsIndexExt;
 
@@ -932,6 +1039,24 @@ mod tests {
             inline_ingest: true,
             ..test_tuning(TEST_COMMIT_INTERVAL, TEST_COMMIT_THRESHOLD)
         }
+    }
+
+    fn disk_tuning(root: &Path) -> crate::FtsTuning {
+        crate::FtsTuning {
+            index_dir: Some(Arc::from(root)),
+            ..test_tuning(TEST_COMMIT_INTERVAL, TEST_COMMIT_THRESHOLD)
+        }
+    }
+
+    fn test_index_id() -> IndexId {
+        IndexIdGenerator::new().next(true).unwrap()
+    }
+
+    fn entries(root: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
     }
 
     async fn add_doc(sender: &mpsc::Sender<FtsIndex>, primary: u64, content: &str) {
@@ -1038,6 +1163,128 @@ mod tests {
 
         assert_eq!(keys.len(), 1);
         assert_eq!(scores.len(), 1);
+    }
+
+    // Index residency is selectable at runtime, so the on-disk path needs its
+    // own coverage for the same reason the inline and shared-lock paths do: a
+    // path that is never tested is a path that will break silently. These
+    // assert that an mmapped index indexes, removes and searches exactly as the
+    // RAM one does, that it really is on disk, and that the directory is both
+    // wiped before use and removed afterwards.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn on_disk_index_indexes_and_removes_documents() {
+        let dir = TempDir::new().unwrap();
+        let table = make_table_with_keys();
+        let sender = make_sender_with(table, disk_tuning(dir.path()));
+
+        add_doc(&sender, 1, "hello world").await;
+        add_doc(&sender, 2, "foo bar").await;
+        rm_doc(&sender, 2).await;
+
+        let count = sender.count(make_index_key()).await.unwrap();
+
+        assert_eq!(count, 1);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn on_disk_index_serves_search() {
+        let dir = TempDir::new().unwrap();
+        let table = make_table_with_keys();
+        let sender = make_sender_with(table, disk_tuning(dir.path()));
+
+        add_doc(&sender, 1, "hello world").await;
+
+        let (keys, scores) = sender
+            .search(
+                make_index_key(),
+                "hello".into(),
+                Limit::from(std::num::NonZeroUsize::new(10).unwrap()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(scores.len(), 1);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn on_disk_index_writes_into_root() {
+        let dir = TempDir::new().unwrap();
+        let table = make_table_with_keys();
+        let sender = make_sender_with(table, disk_tuning(dir.path()));
+
+        for primary in 0..TEST_COMMIT_THRESHOLD as u64 {
+            add_doc(&sender, primary, "hello world").await;
+        }
+        sender.count(make_index_key()).await.unwrap();
+
+        let entries = entries(dir.path());
+        assert_eq!(entries.len(), 1, "expected one index dir, got {entries:?}");
+        assert_eq!(
+            entries[0].file_name().unwrap().to_str().unwrap(),
+            index_dir_name(&make_index_key(), test_index_id())
+        );
+        assert!(entries[0].join("meta.json").is_file());
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn on_disk_index_clears_pre_existing_directory() {
+        let dir = TempDir::new().unwrap();
+        let stale = dir
+            .path()
+            .join(index_dir_name(&make_index_key(), test_index_id()));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("meta.json"), b"not an index").unwrap();
+        std::fs::write(stale.join("stale.seg"), b"old segment").unwrap();
+
+        let table = make_table_with_keys();
+        let sender = make_sender_with(table, disk_tuning(dir.path()));
+
+        add_doc(&sender, 1, "hello world").await;
+        let count = sender.count(make_index_key()).await.unwrap();
+
+        assert_eq!(count, 1);
+        assert!(!stale.join("stale.seg").exists());
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn on_disk_index_dir_removed_when_actor_stops() {
+        let dir = TempDir::new().unwrap();
+        let table = make_table_with_keys();
+        let sender = make_sender_with(table, disk_tuning(dir.path()));
+
+        add_doc(&sender, 1, "hello world").await;
+        assert_eq!(entries(dir.path()).len(), 1);
+
+        drop(sender);
+
+        while !entries(dir.path()).is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[test]
+    fn index_dir_name_is_path_safe() {
+        let key = IndexKey::new(&"../ks/evil".into(), &"idx".into());
+
+        let name = index_dir_name(&key, test_index_id());
+
+        assert!(!name.contains('/'), "{name}");
+        assert!(!name.contains(".."), "{name}");
+        assert_ne!(
+            index_dir_name(&key, IndexId::from(1)),
+            index_dir_name(&key, IndexId::from(2))
+        );
     }
 
     #[rstest]

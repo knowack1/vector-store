@@ -74,6 +74,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -182,7 +183,7 @@ impl DiskannAlpha {
 /// these knobs is a strict superset of one without them. They exist so the
 /// ingest bottleneck can be located by configuration instead of by rebuilding
 /// once per hypothesis.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FtsTuning {
     /// Commit the writer this often.
     pub commit_interval: Duration,
@@ -219,6 +220,19 @@ pub struct FtsTuning {
     /// building the document does not tokenize, and `IndexWriter::add_document`
     /// only pushes onto tantivy's queue for its own indexing threads.
     pub inline_ingest: bool,
+    /// Root directory for the tantivy index. `None` keeps the index in RAM
+    /// (`Index::create_in_ram`), which is the compiled-in behaviour. When set,
+    /// each index gets its own freshly created subdirectory under this root,
+    /// backed by a `MmapDirectory`.
+    ///
+    /// Scratch, not storage: the subdirectory is wiped at create and removed on
+    /// drop, and there is no reopen path, so a restart still rebuilds the index
+    /// by the full base-table scan exactly as the RAM build does. What changes
+    /// is only where the index pages live -- and with them, which memory the
+    /// allocation gate can see: a RAM index is anonymous memory and is counted
+    /// against `VECTOR_STORE_MEMORY_LIMIT`, an mmapped one is file-backed page
+    /// cache and is not.
+    pub index_dir: Option<Arc<Path>>,
 }
 
 impl Default for FtsTuning {
@@ -233,6 +247,7 @@ impl Default for FtsTuning {
             writer_memory_bytes: 15_000_000,
             merge_threads: 4,
             inline_ingest: false,
+            index_dir: None,
         }
     }
 }
@@ -823,7 +838,7 @@ pub async fn run(
     let config_rx = config_receivers.config.clone();
     let opensearch_addr = config_rx.borrow().opensearch_addr.clone();
     let use_diskann = config_rx.borrow().use_diskann;
-    let fts_tuning = config_rx.borrow().fts_tuning;
+    let fts_tuning = config_rx.borrow().fts_tuning.clone();
 
     let internals = internals::new();
     let memory = memory::new(internals.clone(), config_rx.clone());
@@ -855,8 +870,7 @@ pub async fn run(
 
     let index_engine_version = vs_index_factory.index_engine_version();
     let indexes = Arc::new(RwLock::new(Indexes::new()));
-    let fts_index_factory =
-        fts_index::new_fts_index_factory_tantivy(worker, memory, fts_tuning);
+    let fts_index_factory = fts_index::new_fts_index_factory_tantivy(worker, memory, fts_tuning);
     let engine = engine::new(
         db_actor,
         engine::IndexFactories {

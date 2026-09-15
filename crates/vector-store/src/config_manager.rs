@@ -16,6 +16,7 @@ use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -624,6 +625,13 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
             ),
         };
     }
+    // The only FTS knob that touches the filesystem, so it is validated here
+    // rather than where the index is built: a failure inside IndexState::new is
+    // logged and the document is then skipped, which is the silent-loss mode
+    // these knobs exist to find. A path that cannot be used must stop startup.
+    if let Ok(value) = env("VECTOR_STORE_FTS_INDEX_DIR") {
+        config.fts_tuning.index_dir = Some(fts_index_dir(value.trim())?);
+    }
 
     config.cql_uri_translation_map = env("VECTOR_STORE_CQL_URI_TRANSLATION_MAP")
         .ok()
@@ -654,6 +662,41 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
     }
 
     Ok(config)
+}
+
+/// Prepare the root directory named by `VECTOR_STORE_FTS_INDEX_DIR`.
+///
+/// Creating it here means a typo, a missing parent or a read-only mount is a
+/// startup failure naming the variable, instead of a per-document error inside
+/// the index actor that only gets logged.
+fn fts_index_dir(path: &str) -> anyhow::Result<Arc<std::path::Path>> {
+    anyhow::ensure!(
+        !path.is_empty(),
+        "VECTOR_STORE_FTS_INDEX_DIR must not be empty"
+    );
+    let root = PathBuf::from(path);
+    std::fs::create_dir_all(&root).map_err(|err| {
+        anyhow!(
+            "VECTOR_STORE_FTS_INDEX_DIR {} could not be created: {err}",
+            root.display()
+        )
+    })?;
+    assert_writable(&root)?;
+    Ok(Arc::from(root.as_path()))
+}
+
+/// `create_dir_all` succeeds on a directory that already exists and cannot be
+/// written to, so the only honest check is to write something.
+fn assert_writable(root: &std::path::Path) -> anyhow::Result<()> {
+    let probe = root.join(format!(".vector-store-probe-{}", std::process::id()));
+    std::fs::write(&probe, b"").map_err(|err| {
+        anyhow!(
+            "VECTOR_STORE_FTS_INDEX_DIR {} is not writable: {err}",
+            root.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1067,5 +1110,54 @@ mod tests {
             tls_file_check_interval(&env),
             DEFAULT_TLS_FILE_CHECK_INTERVAL
         );
+    }
+
+    // The FTS index dir is the one tunable that touches the filesystem, and the
+    // whole reason it is resolved during startup is that a path which cannot be
+    // used must fail loudly here instead of being discovered per document.
+    #[tokio::test]
+    async fn fts_index_dir_none_when_unset() {
+        let env = mock_env(HashMap::new());
+
+        let config = load_config(env).await.unwrap();
+
+        assert!(config.fts_tuning.index_dir.is_none());
+    }
+
+    #[tokio::test]
+    async fn fts_index_dir_creates_missing_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("nested/index-root");
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_FTS_INDEX_DIR",
+            root.to_str().unwrap().into(),
+        )]));
+
+        let config = load_config(env).await.unwrap();
+
+        assert_eq!(config.fts_tuning.index_dir.as_deref(), Some(root.as_path()));
+        assert!(root.is_dir());
+    }
+
+    #[tokio::test]
+    async fn fts_index_dir_rejects_path_that_is_a_file() {
+        let file = NamedTempFile::new().unwrap();
+        let env = mock_env(HashMap::from([("VECTOR_STORE_FTS_INDEX_DIR", path(&file))]));
+
+        let err = load_config(env).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("VECTOR_STORE_FTS_INDEX_DIR"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fts_index_dir_rejects_empty() {
+        let env = mock_env(HashMap::from([("VECTOR_STORE_FTS_INDEX_DIR", "  ".into())]));
+
+        let err = load_config(env).await.unwrap_err();
+
+        assert!(err.to_string().contains("must not be empty"), "{err}");
     }
 }
