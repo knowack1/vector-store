@@ -4,6 +4,7 @@
  */
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -256,6 +257,30 @@ fn commit(state: &IndexState, key: &IndexKey) {
         .commit(|| state.reader.reload());
     if let Err(err) = result {
         error!("fts: failed to commit for {key}: {err}");
+    }
+}
+
+/// Whether the reader still serves a segment set that background merges have replaced.
+///
+/// The reader is reloaded only on commit, so a merge finishing after the last commit
+/// would otherwise stay invisible until the next write.
+fn reader_misses_merges(state: &IndexState) -> tantivy::Result<bool> {
+    let searchable: BTreeSet<_> = state.index.searchable_segment_ids()?.into_iter().collect();
+    let served: BTreeSet<_> = state
+        .reader
+        .searcher()
+        .segment_readers()
+        .iter()
+        .map(|segment| segment.segment_id())
+        .collect();
+    Ok(served != searchable)
+}
+
+fn reload_after_merges(state: &IndexState, key: &IndexKey) {
+    let result = reader_misses_merges(state)
+        .and_then(|stale| if stale { state.reader.reload() } else { Ok(()) });
+    if let Err(err) = result {
+        error!("fts: failed to reload reader after merges for {key}: {err}");
     }
 }
 
@@ -631,12 +656,13 @@ pub(crate) fn new(
                 }
                 _ = interval.tick() => {
                     for state in states.values() {
-                        if !state.writer.read().unwrap().has_uncommitted_docs() {
-                            continue;
-                        }
                         let state = Arc::clone(state);
                         let key = key.clone();
-                        worker.spawn_blocking(move || commit(&state, &key)).await;
+                        if state.writer.read().unwrap().has_uncommitted_docs() {
+                            worker.spawn_blocking(move || commit(&state, &key)).await;
+                        } else {
+                            worker.spawn_blocking(move || reload_after_merges(&state, &key)).await;
+                        }
                     }
                 }
             }
@@ -1054,6 +1080,65 @@ mod tests {
             );
             tokio::time::sleep(TEST_COMMIT_INTERVAL).await;
         }
+    }
+
+    fn commit_segments(state: &IndexState, segments: u64) {
+        let key = make_index_key();
+        for segment in 0..segments {
+            let primary_id = PrimaryId::from(segment);
+            let (tx, _rx) = mpsc::channel(1);
+            handle_add_document(
+                state,
+                primary_id,
+                format!("segment {segment} body text"),
+                AsyncInProgress::Fullscan(tx),
+            );
+            commit(state, &key);
+        }
+    }
+
+    fn searchable_segment_ids(state: &IndexState) -> BTreeSet<tantivy::index::SegmentId> {
+        state
+            .index
+            .searchable_segment_ids()
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    fn served_segment_ids(state: &IndexState) -> BTreeSet<tantivy::index::SegmentId> {
+        state
+            .reader
+            .searcher()
+            .segment_readers()
+            .iter()
+            .map(|segment| segment.segment_id())
+            .collect()
+    }
+
+    async fn wait_for_merges(state: &IndexState) {
+        let deadline = tokio::time::Instant::now() + MERGE_SETTLE_TIMEOUT;
+        while searchable_segment_ids(state).len() as u64 >= MERGE_POLICY_MIN_NUM_SEGMENTS {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "background merge did not finish"
+            );
+            tokio::time::sleep(TEST_COMMIT_INTERVAL).await;
+        }
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn reload_after_merges_serves_the_index_searchable_segments() {
+        let state = IndexState::new(Analyzer::default(), Positions::default()).unwrap();
+        commit_segments(&state, MERGE_POLICY_MIN_NUM_SEGMENTS);
+        wait_for_merges(&state).await;
+        assert_ne!(served_segment_ids(&state), searchable_segment_ids(&state));
+
+        reload_after_merges(&state, &make_index_key());
+
+        assert_eq!(served_segment_ids(&state), searchable_segment_ids(&state));
     }
 
     async fn highlight(
