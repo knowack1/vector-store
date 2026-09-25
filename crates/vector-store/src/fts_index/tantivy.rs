@@ -1141,6 +1141,74 @@ mod tests {
         assert_eq!(served_segment_ids(&state), searchable_segment_ids(&state));
     }
 
+    const SHARED_TERM: &str = "shared";
+
+    fn unique_term(id: u64) -> String {
+        format!("doc{id}")
+    }
+
+    fn commit_segment_of_docs(state: &IndexState, ids: std::ops::Range<u64>) {
+        for id in ids {
+            let (tx, _rx) = mpsc::channel(1);
+            handle_add_document(
+                state,
+                PrimaryId::from(id),
+                format!("{SHARED_TERM} {}", unique_term(id)),
+                AsyncInProgress::Fullscan(tx),
+            );
+        }
+        commit(state, &make_index_key());
+    }
+
+    fn search_state(state: &IndexState, query: &str) -> Vec<PrimaryKey> {
+        let (keys, _) = handle_search(
+            state,
+            &make_table_with_keys(),
+            &make_index_key(),
+            query,
+            Limit::from(std::num::NonZeroUsize::new(100).unwrap()),
+        )
+        .unwrap();
+        keys
+    }
+
+    fn primary_key(id: u64) -> PrimaryKey {
+        PrimaryKey::from(vec![CqlValue::BigInt(id as i64)])
+    }
+
+    fn sorted(mut keys: Vec<PrimaryKey>) -> Vec<PrimaryKey> {
+        keys.sort();
+        keys
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn search_maps_hits_in_every_segment_to_their_primary_keys() {
+        const SEGMENTS: u64 = 3;
+        const DOCS_PER_SEGMENT: u64 = 4;
+        const DOCS: u64 = SEGMENTS * DOCS_PER_SEGMENT;
+        let state = IndexState::new(Analyzer::default(), Positions::default()).unwrap();
+        for segment in 0..SEGMENTS {
+            commit_segment_of_docs(
+                &state,
+                segment * DOCS_PER_SEGMENT..(segment + 1) * DOCS_PER_SEGMENT,
+            );
+        }
+        assert!(state.reader.searcher().segment_readers().len() > 1);
+
+        for id in 0..DOCS {
+            assert_eq!(
+                search_state(&state, &unique_term(id)),
+                vec![primary_key(id)]
+            );
+        }
+        assert_eq!(
+            sorted(search_state(&state, SHARED_TERM)),
+            sorted((0..DOCS).map(primary_key).collect())
+        );
+    }
+
     async fn highlight(
         sender: &mpsc::Sender<FtsIndex>,
         query: &str,
