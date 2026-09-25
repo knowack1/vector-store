@@ -6,16 +6,20 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::btree_map::Entry;
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::anyhow;
 use tantivy::DocAddress;
+use tantivy::FutureResult;
 use tantivy::IndexWriter;
 use tantivy::ReloadPolicy;
 use tantivy::Searcher;
@@ -25,7 +29,11 @@ use tantivy::TantivyDocument;
 use tantivy::collector::TopDocs;
 use tantivy::columnar::Column;
 use tantivy::index::SegmentId;
+use tantivy::index::SegmentMeta;
 use tantivy::indexer::IndexWriterOptions;
+use tantivy::indexer::LogMergePolicy;
+use tantivy::indexer::MergePolicy;
+use tantivy::indexer::NoMergePolicy;
 use tantivy::query::BooleanQuery;
 use tantivy::query::BoostQuery;
 use tantivy::query::Occur;
@@ -50,9 +58,11 @@ use tokio::sync::watch;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 
 use crate::Analyzer;
 use crate::AsyncInProgress;
+use crate::FtsTuning;
 use crate::IndexKey;
 use crate::Limit;
 use crate::Positions;
@@ -74,15 +84,25 @@ use super::actor::FtsIndex;
 use super::actor::FtsSearchR;
 use super::actor::FtsStats;
 use super::actor::FtsStatsR;
+use super::consolidation;
 
 pub(crate) struct TantivyIndexFactory {
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
+    tuning: FtsTuning,
 }
 
 impl TantivyIndexFactory {
-    pub(crate) fn new(worker: async_channel::Sender<Worker>, memory: mpsc::Sender<Memory>) -> Self {
-        Self { worker, memory }
+    pub(crate) fn new(
+        worker: async_channel::Sender<Worker>,
+        memory: mpsc::Sender<Memory>,
+        tuning: FtsTuning,
+    ) -> Self {
+        Self {
+            worker,
+            memory,
+            tuning,
+        }
     }
 }
 
@@ -99,6 +119,7 @@ impl FtsIndexFactory for TantivyIndexFactory {
             self.memory.clone(),
             COMMIT_INTERVAL,
             MAX_UNCOMMITTED_THRESHOLD,
+            self.tuning,
         )
     }
 }
@@ -150,13 +171,14 @@ struct IndexState {
     reader: tantivy::IndexReader,
     primary_ids: PrimaryIdColumns,
     schema: Schema,
+    consolidating: AtomicBool,
 }
 
 const COMMIT_INTERVAL: Duration = Duration::from_secs(3);
 const MAX_UNCOMMITTED_THRESHOLD: usize = 10_000;
 
 impl IndexState {
-    fn new(analyzer: Analyzer, positions: Positions) -> anyhow::Result<Self> {
+    fn new(analyzer: Analyzer, positions: Positions, tuning: FtsTuning) -> anyhow::Result<Self> {
         let tokenizer = analyzer.to_string();
         let schema = build_schema(&tokenizer, positions);
         let index = tantivy::Index::create_in_ram(schema.clone());
@@ -165,7 +187,13 @@ impl IndexState {
             .register(&tokenizer, build_token_pipeline(analyzer)?);
         let options = IndexWriterOptions::builder()
             .num_worker_threads(perf::num_workers().into())
+            .memory_budget_per_thread(tuning.writer_memory_bytes)
             .build();
+        info!(
+            "fts: index writer using {} threads, {} MB buffer per thread",
+            perf::num_workers(),
+            tuning.writer_memory_bytes / 1_000_000
+        );
         let writer = index
             .writer_with_options(options)
             .map_err(|e| anyhow!("fts: failed to create writer: {e}"))?;
@@ -183,6 +211,7 @@ impl IndexState {
             reader,
             primary_ids: PrimaryIdColumns::default(),
             schema,
+            consolidating: AtomicBool::new(false),
         })
     }
 }
@@ -324,6 +353,139 @@ fn reload_after_merges(state: &IndexState, key: &IndexKey) {
     if let Err(err) = result {
         error!("fts: failed to reload reader after merges for {key}: {err}");
     }
+}
+
+/// Merge attempts that consolidation allows beyond the fewest it needs to reach its target.
+/// A merge fails harmlessly when a background merge, already running when consolidation
+/// began, replaces one of its input segments first.
+const MAX_FAILED_CONSOLIDATION_MERGES: usize = 3;
+
+fn start_consolidation(
+    state: &Arc<IndexState>,
+    key: IndexKey,
+    target: NonZeroUsize,
+    allocate: watch::Receiver<Allocate>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if state.consolidating.swap(true, Ordering::AcqRel) {
+        debug!("fts: consolidation of {key} is already running");
+        return None;
+    }
+    Some(tokio::spawn(consolidate(
+        Arc::downgrade(state),
+        key,
+        target,
+        allocate,
+    )))
+}
+
+/// Merges the index down to at most `target` segments, one bounded merge at a time.
+///
+/// Tantivy's merge policy is off meanwhile, so it cannot start merges that race ours for
+/// the same segments. Weak, so that dropping the index stops the consolidation.
+async fn consolidate(
+    state: Weak<IndexState>,
+    key: IndexKey,
+    target: NonZeroUsize,
+    allocate: watch::Receiver<Allocate>,
+) {
+    info!("fts: consolidating {key} to at most {target} segments");
+    let Some(excess) = on_state(&state, move |state| {
+        set_merge_policy(state, Box::new(NoMergePolicy));
+        searchable_segment_count(state).saturating_sub(target.get())
+    })
+    .await
+    else {
+        return;
+    };
+    merge_down(&state, &key, target, &allocate, excess).await;
+    on_state(&state, move |state| finish_consolidation(state, &key)).await;
+}
+
+async fn merge_down(
+    state: &Weak<IndexState>,
+    key: &IndexKey,
+    target: NonZeroUsize,
+    allocate: &watch::Receiver<Allocate>,
+    excess: usize,
+) {
+    for _ in 0..excess + MAX_FAILED_CONSOLIDATION_MERGES {
+        if *allocate.borrow() == Allocate::Cannot {
+            warn!("fts: stopping consolidation of {key}: not enough memory");
+            return;
+        }
+        let Some(merge) = on_state(state, move |state| start_next_merge(state, target)).await
+        else {
+            return;
+        };
+        match merge {
+            Ok(Some(merge)) => await_merge(state, key, merge).await,
+            Ok(None) => return,
+            Err(err) => {
+                error!("fts: failed to plan a consolidation merge for {key}: {err}");
+                return;
+            }
+        }
+    }
+}
+
+/// Reloads after each merge rather than on the next tick, so the reader releases the
+/// merged-away segments before the next merge needs memory for its own output.
+async fn await_merge(
+    state: &Weak<IndexState>,
+    key: &IndexKey,
+    merge: FutureResult<Option<SegmentMeta>>,
+) {
+    if let Err(err) = merge.await {
+        warn!("fts: consolidation merge for {key} failed: {err}");
+        return;
+    }
+    let key = key.clone();
+    on_state(state, move |state| reload_after_merges(state, &key)).await;
+}
+
+/// Runs `f` on a blocking thread: the writer lock it may take is held across whole commits.
+async fn on_state<R: Send + 'static>(
+    state: &Weak<IndexState>,
+    f: impl FnOnce(&IndexState) -> R + Send + 'static,
+) -> Option<R> {
+    let state = state.upgrade()?;
+    tokio::task::spawn_blocking(move || f(&state)).await.ok()
+}
+
+fn start_next_merge(
+    state: &IndexState,
+    target: NonZeroUsize,
+) -> tantivy::Result<Option<FutureResult<Option<SegmentMeta>>>> {
+    let segments: Vec<_> = state
+        .index
+        .searchable_segment_metas()?
+        .iter()
+        .map(|meta| (meta.id(), u64::from(meta.num_docs())))
+        .collect();
+    Ok(consolidation::next_merge(&segments, target)
+        .map(|segment_ids| state.writer.write().unwrap().writer.merge(&segment_ids)))
+}
+
+fn set_merge_policy(state: &IndexState, policy: Box<dyn MergePolicy>) {
+    state.writer.read().unwrap().writer.set_merge_policy(policy);
+}
+
+fn searchable_segment_count(state: &IndexState) -> usize {
+    state
+        .index
+        .searchable_segment_ids()
+        .map(|ids| ids.len())
+        .unwrap_or(0)
+}
+
+fn finish_consolidation(state: &IndexState, key: &IndexKey) {
+    set_merge_policy(state, Box::new(LogMergePolicy::default()));
+    reload_after_merges(state, key);
+    state.consolidating.store(false, Ordering::Release);
+    info!(
+        "fts: consolidation of {key} finished, serving {} segments",
+        state.reader.searcher().segment_readers().len()
+    );
 }
 
 fn handle_add_document(
@@ -605,13 +767,14 @@ fn get_or_create_state<T: TableSearch>(
     states: &mut BTreeMap<IndexId, Arc<IndexState>>,
     table: &RwLock<T>,
     index: &FtsIndexConfiguration,
+    tuning: FtsTuning,
 ) -> Option<Arc<IndexState>> {
     let key = &index.key;
     let index_id = table.read().unwrap().index_id(key)?;
     if let Some(state) = states.get(&index_id) {
         return Some(Arc::clone(state));
     }
-    match IndexState::new(index.analyzer, index.positions) {
+    match IndexState::new(index.analyzer, index.positions, tuning) {
         Ok(state) => {
             let state = Arc::new(state);
             states.insert(index_id, Arc::clone(&state));
@@ -657,6 +820,7 @@ pub(crate) fn new(
     memory: mpsc::Sender<Memory>,
     commit_interval: Duration,
     commit_threshold: usize,
+    tuning: FtsTuning,
 ) -> mpsc::Sender<FtsIndex> {
     let (tx, mut rx) = mpsc::channel::<FtsIndex>(perf::channel_size().into());
     tokio::spawn(async move {
@@ -686,6 +850,7 @@ pub(crate) fn new(
                                 &mut states,
                                 table.as_ref(),
                                 &index,
+                                tuning,
                             ) else {
                                 continue;
                             };
@@ -715,6 +880,7 @@ pub(crate) fn new(
                                 &mut states,
                                 table.as_ref(),
                                 &index,
+                                tuning,
                             ) else {
                                 continue;
                             };
@@ -776,6 +942,19 @@ pub(crate) fn new(
                                     _ = tx.send(result);
                                 })
                                 .await;
+                        }
+                        FtsIndex::Consolidate { index_key } => {
+                            let Some(target) = tuning.target_segments else {
+                                continue;
+                            };
+                            if let Some(state) = get_state(&states, table.as_ref(), &index_key) {
+                                start_consolidation(
+                                    &state,
+                                    index_key,
+                                    target,
+                                    allocate_rx.clone(),
+                                );
+                            }
                         }
                         FtsIndex::Stats { index_key, tx } => {
                             let Some(state) = get_state(&states, table.as_ref(), &index_key)
@@ -881,18 +1060,27 @@ mod tests {
         analyzer: Analyzer,
         positions: Positions,
     ) -> mpsc::Sender<FtsIndex> {
-        let memory = make_memory_actor();
+        let configuration = FtsIndexConfiguration {
+            analyzer,
+            positions,
+            ..make_configuration()
+        };
+        make_sender_with_tuning(table, configuration, FtsTuning::default())
+    }
+
+    fn make_sender_with_tuning(
+        table: Arc<RwLock<MockTableSearch>>,
+        configuration: FtsIndexConfiguration,
+        tuning: FtsTuning,
+    ) -> mpsc::Sender<FtsIndex> {
         new(
-            FtsIndexConfiguration {
-                analyzer,
-                positions,
-                ..make_configuration()
-            },
+            configuration,
             table,
             worker::new(),
-            memory,
+            make_memory_actor(),
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
+            tuning,
         )
     }
 
@@ -1126,6 +1314,7 @@ mod tests {
             memory,
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
+            FtsTuning::default(),
         );
 
         add_doc(&sender, 1, "should not be indexed").await;
@@ -1148,6 +1337,7 @@ mod tests {
             memory,
             Duration::from_secs(3600),
             TEST_COMMIT_THRESHOLD,
+            FtsTuning::default(),
         );
         let (tx, mut rx) = mpsc::channel(1);
 
@@ -1269,7 +1459,12 @@ mod tests {
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
     async fn reload_after_merges_serves_the_index_searchable_segments() {
-        let state = IndexState::new(Analyzer::default(), Positions::default()).unwrap();
+        let state = IndexState::new(
+            Analyzer::default(),
+            Positions::default(),
+            FtsTuning::default(),
+        )
+        .unwrap();
         commit_segments(&state, MERGE_POLICY_MIN_NUM_SEGMENTS);
         wait_for_merges(&state).await;
         assert_ne!(served_segment_ids(&state), searchable_segment_ids(&state));
@@ -1319,6 +1514,91 @@ mod tests {
         keys
     }
 
+    /// Below the merge policy's minimum, so only consolidation can merge them.
+    const CONSOLIDATION_TEST_SEGMENTS: u64 = 6;
+    const CONSOLIDATION_TEST_TARGET: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+
+    fn tuning_with_target(target_segments: Option<NonZeroUsize>) -> FtsTuning {
+        FtsTuning {
+            target_segments,
+            ..FtsTuning::default()
+        }
+    }
+
+    async fn sender_with_committed_segments(
+        target_segments: Option<NonZeroUsize>,
+    ) -> mpsc::Sender<FtsIndex> {
+        let sender = make_sender_with_tuning(
+            make_table_with_keys(),
+            make_configuration(),
+            tuning_with_target(target_segments),
+        );
+        for segment in 0..CONSOLIDATION_TEST_SEGMENTS {
+            add_committed_segment(&sender, segment).await;
+        }
+        sender
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn consolidate_merges_the_index_down_to_the_target_segment_count() {
+        let sender = sender_with_committed_segments(Some(CONSOLIDATION_TEST_TARGET)).await;
+
+        sender.consolidate(make_index_key()).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + MERGE_SETTLE_TIMEOUT;
+        while segment_count(&sender).await > CONSOLIDATION_TEST_TARGET.get() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "reader still serves {} segments after consolidation",
+                segment_count(&sender).await
+            );
+            tokio::time::sleep(TEST_COMMIT_INTERVAL).await;
+        }
+        let docs = CONSOLIDATION_TEST_SEGMENTS as usize * TEST_COMMIT_THRESHOLD;
+        assert_eq!(sender.count(make_index_key()).await.unwrap(), docs);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn consolidate_is_ignored_without_a_target() {
+        let sender = sender_with_committed_segments(None).await;
+
+        sender.consolidate(make_index_key()).await.unwrap();
+        tokio::time::sleep(TEST_COMMIT_INTERVAL * 5).await;
+
+        assert_eq!(
+            segment_count(&sender).await as u64,
+            CONSOLIDATION_TEST_SEGMENTS
+        );
+    }
+
+    fn state_with_committed_segments() -> Arc<IndexState> {
+        let state = IndexState::new(
+            Analyzer::default(),
+            Positions::default(),
+            FtsTuning::default(),
+        )
+        .unwrap();
+        commit_segments(&state, CONSOLIDATION_TEST_SEGMENTS);
+        Arc::new(state)
+    }
+
+    fn spawn_consolidation(
+        state: &Arc<IndexState>,
+        allocate: Allocate,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let (_allocate_tx, allocate_rx) = watch::channel(allocate);
+        start_consolidation(
+            state,
+            make_index_key(),
+            CONSOLIDATION_TEST_TARGET,
+            allocate_rx,
+        )
+    }
+
     #[rstest]
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
@@ -1326,7 +1606,12 @@ mod tests {
         const SEGMENTS: u64 = 3;
         const DOCS_PER_SEGMENT: u64 = 4;
         const DOCS: u64 = SEGMENTS * DOCS_PER_SEGMENT;
-        let state = IndexState::new(Analyzer::default(), Positions::default()).unwrap();
+        let state = IndexState::new(
+            Analyzer::default(),
+            Positions::default(),
+            FtsTuning::default(),
+        )
+        .unwrap();
         for segment in 0..SEGMENTS {
             commit_segment_of_docs(
                 &state,
@@ -1363,7 +1648,12 @@ mod tests {
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
     async fn search_reads_primary_ids_from_columns_opened_at_commit() {
-        let state = IndexState::new(Analyzer::default(), Positions::default()).unwrap();
+        let state = IndexState::new(
+            Analyzer::default(),
+            Positions::default(),
+            FtsTuning::default(),
+        )
+        .unwrap();
         commit_segment_of_docs(&state, 0..4);
         commit_segment_of_docs(&state, 4..8);
         assert_eq!(cached_segment_ids(&state), served_segment_ids(&state));
@@ -1378,8 +1668,33 @@ mod tests {
     #[rstest]
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
+    async fn delete_committed_during_consolidation_stays_applied() {
+        let state = state_with_committed_segments();
+        let consolidation = spawn_consolidation(&state, Allocate::Can).unwrap();
+
+        let (tx, _rx) = mpsc::channel(1);
+        handle_remove_document(&state, PrimaryId::from(0), AsyncInProgress::Fullscan(tx));
+        commit(&state, &make_index_key());
+        consolidation.await.unwrap();
+
+        assert_eq!(
+            state.reader.searcher().num_docs(),
+            CONSOLIDATION_TEST_SEGMENTS - 1
+        );
+        assert!(served_segment_ids(&state).len() <= CONSOLIDATION_TEST_TARGET.get());
+        assert!(!state.consolidating.load(Ordering::Acquire));
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
     async fn reload_after_merges_caches_only_the_served_segments_columns() {
-        let state = IndexState::new(Analyzer::default(), Positions::default()).unwrap();
+        let state = IndexState::new(
+            Analyzer::default(),
+            Positions::default(),
+            FtsTuning::default(),
+        )
+        .unwrap();
         commit_segments(&state, MERGE_POLICY_MIN_NUM_SEGMENTS);
         wait_for_merges(&state).await;
         assert_ne!(cached_segment_ids(&state), searchable_segment_ids(&state));
@@ -1393,7 +1708,12 @@ mod tests {
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
     async fn search_opens_a_column_missing_from_the_cache_once_per_query() {
-        let state = IndexState::new(Analyzer::default(), Positions::default()).unwrap();
+        let state = IndexState::new(
+            Analyzer::default(),
+            Positions::default(),
+            FtsTuning::default(),
+        )
+        .unwrap();
         commit_segment_of_docs(&state, 0..4);
         *state.primary_ids.served.write().unwrap() = Arc::default();
 
@@ -1402,6 +1722,54 @@ mod tests {
             all_primary_keys(0..4)
         );
         assert_eq!(primary_id_misses(&state), 1);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn consolidation_does_not_merge_when_memory_is_exhausted() {
+        let state = state_with_committed_segments();
+
+        spawn_consolidation(&state, Allocate::Cannot)
+            .unwrap()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            searchable_segment_ids(&state).len() as u64,
+            CONSOLIDATION_TEST_SEGMENTS
+        );
+        assert!(!state.consolidating.load(Ordering::Acquire));
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn consolidation_already_running_is_not_started_again() {
+        let state = state_with_committed_segments();
+
+        let first = spawn_consolidation(&state, Allocate::Can);
+        let second = spawn_consolidation(&state, Allocate::Can);
+
+        assert!(first.is_some());
+        assert!(second.is_none());
+        first.unwrap().await.unwrap();
+        assert!(spawn_consolidation(&state, Allocate::Can).is_some());
+    }
+
+    #[rstest]
+    #[case(15_000_000)]
+    #[case(4_293_000_000)]
+    #[tokio::test]
+    async fn writer_accepts_the_configurable_memory_budget_bounds(#[case] bytes: usize) {
+        let tuning = FtsTuning {
+            writer_memory_bytes: bytes,
+            ..FtsTuning::default()
+        };
+
+        let state = IndexState::new(Analyzer::default(), Positions::default(), tuning);
+
+        assert!(state.is_ok(), "{bytes} bytes rejected: {:?}", state.err());
     }
 
     async fn highlight(

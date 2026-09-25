@@ -10,12 +10,14 @@ use crate::IndexKey;
 use crate::IndexKind;
 use crate::IndexMetadata;
 use crate::Metrics;
+use crate::Progress;
 use crate::db::Db;
 use crate::db::DbExt;
 use crate::db_index::DbIndex;
 use crate::db_index::DbIndexExt;
 use crate::fts_index::FtsIndex;
 use crate::fts_index::FtsIndexConfiguration;
+use crate::fts_index::FtsIndexExt;
 use crate::fts_index::FtsIndexFactory;
 use crate::indexes::Indexes;
 use crate::monitor_indexes;
@@ -422,9 +424,25 @@ async fn update_indexes(node_state: &Sender<NodeState>, indexes: &RwLock<Indexes
             } else if let Some(entry) = indexes.get_fts_mut(&key) {
                 entry.set_progress(new_progress);
                 entry.set_status(new_status);
+                if full_scan_finished(progress, new_progress) {
+                    request_fts_consolidation(entry.index().clone(), key.clone());
+                }
             }
         }
     }
+}
+
+fn full_scan_finished(before: Progress, after: Progress) -> bool {
+    before != Progress::Done && after == Progress::Done
+}
+
+/// Spawned, because the index actor may be busy ingesting and the engine must not wait on it.
+fn request_fts_consolidation(index: mpsc::Sender<FtsIndex>, key: IndexKey) {
+    tokio::spawn(async move {
+        if let Err(err) = index.consolidate(key.clone()).await {
+            debug!("unable to request consolidation of {key}: {err}");
+        }
+    });
 }
 
 #[cfg(test)]
@@ -484,6 +502,18 @@ pub(crate) mod tests {
         );
 
         tx
+    }
+
+    fn in_progress(percent: f64) -> Progress {
+        Progress::InProgress(crate::Percentage::try_from(percent).unwrap())
+    }
+
+    #[test]
+    fn full_scan_finished_only_on_the_transition_to_done() {
+        assert!(full_scan_finished(in_progress(99.0), Progress::Done));
+        assert!(!full_scan_finished(Progress::Done, Progress::Done));
+        assert!(!full_scan_finished(in_progress(10.0), in_progress(20.0)));
+        assert!(!full_scan_finished(Progress::Done, in_progress(0.0)));
     }
 
     /// A local index can declare a filtering column ("ck") that is also one of the base

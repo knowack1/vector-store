@@ -54,6 +54,8 @@ pub(crate) enum FtsIndex {
         index_key: IndexKey,
         tx: oneshot::Sender<FtsStatsR>,
     },
+    /// Merge the index down to the configured segment count, in the background.
+    Consolidate { index_key: IndexKey },
 }
 
 pub(crate) trait FtsIndexExt {
@@ -77,6 +79,7 @@ pub(crate) trait FtsIndexExt {
         documents: Vec<String>,
     ) -> FtsHighlightR;
     async fn stats(&self, index_key: IndexKey) -> FtsStatsR;
+    async fn consolidate(&self, index_key: IndexKey) -> anyhow::Result<()>;
 }
 
 impl FtsIndexExt for mpsc::Sender<FtsIndex> {
@@ -147,5 +150,9 @@ impl FtsIndexExt for mpsc::Sender<FtsIndex> {
         let (tx, rx) = oneshot::channel();
         self.send(FtsIndex::Stats { index_key, tx }).await?;
         rx.await?
+    }
+
+    async fn consolidate(&self, index_key: IndexKey) -> anyhow::Result<()> {
+        Ok(self.send(FtsIndex::Consolidate { index_key }).await?)
     }
 }

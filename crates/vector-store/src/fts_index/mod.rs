@@ -4,9 +4,11 @@
  */
 
 mod actor;
+mod consolidation;
 mod factory;
 mod tantivy;
 
+use crate::FtsTuning;
 use crate::memory::Memory;
 use crate::worker::Worker;
 pub(crate) use actor::FtsIndex;
@@ -20,6 +22,7 @@ use tokio::sync::mpsc;
 pub(crate) fn new_fts_index_factory_tantivy(
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
+    tuning: FtsTuning,
 ) -> Box<dyn FtsIndexFactory + Send + Sync> {
-    Box::new(TantivyIndexFactory::new(worker, memory))
+    Box::new(TantivyIndexFactory::new(worker, memory, tuning))
 }
