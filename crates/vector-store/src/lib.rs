@@ -200,6 +200,26 @@ impl DiskannAlpha {
     }
 }
 
+/// Tuning of the full-text index writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FtsTuning {
+    /// Tantivy's indexing buffer per writer thread, in bytes. A thread flushes its
+    /// segment as soon as the buffer is full, so a small budget means many small segments.
+    pub writer_memory_bytes: usize,
+}
+
+impl FtsTuning {
+    pub const DEFAULT_WRITER_MEMORY_MB: usize = 256;
+}
+
+impl Default for FtsTuning {
+    fn default() -> Self {
+        Self {
+            writer_memory_bytes: Self::DEFAULT_WRITER_MEMORY_MB * 1_000_000,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub vector_store_addr: std::net::SocketAddr,
@@ -215,6 +235,7 @@ pub struct Config {
     pub diskann_backend: Option<DiskannBackendKind>,
     pub alter_index_simulator: bool,
     pub fulltext_indexes: bool,
+    pub fts_tuning: FtsTuning,
     pub cql_connection_timeout: Option<Duration>,
     pub cql_keepalive_interval: Option<Duration>,
     pub cql_keepalive_timeout: Option<Duration>,
@@ -251,6 +272,7 @@ impl Default for Config {
             diskann_backend: None,
             alter_index_simulator: false,
             fulltext_indexes: true,
+            fts_tuning: FtsTuning::default(),
             disable_colors: false,
             tls_cert_path: None,
             tls_key_path: None,
@@ -904,6 +926,7 @@ pub async fn run(
     let config_rx = config_receivers.config.clone();
     let opensearch_addr = config_rx.borrow().opensearch_addr.clone();
     let diskann_backend = config_rx.borrow().diskann_backend;
+    let fts_tuning = config_rx.borrow().fts_tuning;
 
     let internals = internals::new();
     let memory = memory::new(internals.clone(), config_rx.clone());
@@ -935,7 +958,7 @@ pub async fn run(
 
     let index_engine_version = vs_index_factory.index_engine_version();
     let indexes = Arc::new(RwLock::new(Indexes::new()));
-    let fts_index_factory = fts_index::new_fts_index_factory_tantivy(worker, memory);
+    let fts_index_factory = fts_index::new_fts_index_factory_tantivy(worker, memory, fts_tuning);
     let engine = engine::new(
         db_actor,
         engine::IndexFactories {

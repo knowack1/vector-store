@@ -39,9 +39,11 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tracing::debug;
 use tracing::error;
+use tracing::info;
 
 use crate::Analyzer;
 use crate::AsyncInProgress;
+use crate::FtsTuning;
 use crate::IndexKey;
 use crate::Limit;
 use crate::Positions;
@@ -67,11 +69,20 @@ use super::actor::FtsStatsR;
 pub(crate) struct TantivyIndexFactory {
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
+    tuning: FtsTuning,
 }
 
 impl TantivyIndexFactory {
-    pub(crate) fn new(worker: async_channel::Sender<Worker>, memory: mpsc::Sender<Memory>) -> Self {
-        Self { worker, memory }
+    pub(crate) fn new(
+        worker: async_channel::Sender<Worker>,
+        memory: mpsc::Sender<Memory>,
+        tuning: FtsTuning,
+    ) -> Self {
+        Self {
+            worker,
+            memory,
+            tuning,
+        }
     }
 }
 
@@ -88,6 +99,7 @@ impl FtsIndexFactory for TantivyIndexFactory {
             self.memory.clone(),
             COMMIT_INTERVAL,
             MAX_UNCOMMITTED_THRESHOLD,
+            self.tuning,
         )
     }
 }
@@ -144,7 +156,7 @@ const COMMIT_INTERVAL: Duration = Duration::from_secs(3);
 const MAX_UNCOMMITTED_THRESHOLD: usize = 10_000;
 
 impl IndexState {
-    fn new(analyzer: Analyzer, positions: Positions) -> anyhow::Result<Self> {
+    fn new(analyzer: Analyzer, positions: Positions, tuning: FtsTuning) -> anyhow::Result<Self> {
         let tokenizer = analyzer.to_string();
         let schema = build_schema(&tokenizer, positions);
         let index = tantivy::Index::create_in_ram(schema.clone());
@@ -153,7 +165,13 @@ impl IndexState {
             .register(&tokenizer, build_token_pipeline(analyzer)?);
         let options = IndexWriterOptions::builder()
             .num_worker_threads(perf::num_workers().into())
+            .memory_budget_per_thread(tuning.writer_memory_bytes)
             .build();
+        info!(
+            "fts: index writer using {} threads, {} MB buffer per thread",
+            perf::num_workers(),
+            tuning.writer_memory_bytes / 1_000_000
+        );
         let writer = index
             .writer_with_options(options)
             .map_err(|e| anyhow!("fts: failed to create writer: {e}"))?;
@@ -442,13 +460,14 @@ fn get_or_create_state<T: TableSearch>(
     states: &mut BTreeMap<IndexId, Arc<IndexState>>,
     table: &RwLock<T>,
     index: &FtsIndexConfiguration,
+    tuning: FtsTuning,
 ) -> Option<Arc<IndexState>> {
     let key = &index.key;
     let index_id = table.read().unwrap().index_id(key)?;
     if let Some(state) = states.get(&index_id) {
         return Some(Arc::clone(state));
     }
-    match IndexState::new(index.analyzer, index.positions) {
+    match IndexState::new(index.analyzer, index.positions, tuning) {
         Ok(state) => {
             let state = Arc::new(state);
             states.insert(index_id, Arc::clone(&state));
@@ -494,6 +513,7 @@ pub(crate) fn new(
     memory: mpsc::Sender<Memory>,
     commit_interval: Duration,
     commit_threshold: usize,
+    tuning: FtsTuning,
 ) -> mpsc::Sender<FtsIndex> {
     let (tx, mut rx) = mpsc::channel::<FtsIndex>(perf::channel_size().into());
     tokio::spawn(async move {
@@ -523,6 +543,7 @@ pub(crate) fn new(
                                 &mut states,
                                 table.as_ref(),
                                 &index,
+                                tuning,
                             ) else {
                                 continue;
                             };
@@ -552,6 +573,7 @@ pub(crate) fn new(
                                 &mut states,
                                 table.as_ref(),
                                 &index,
+                                tuning,
                             ) else {
                                 continue;
                             };
@@ -729,6 +751,7 @@ mod tests {
             memory,
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
+            FtsTuning::default(),
         )
     }
 
@@ -962,6 +985,7 @@ mod tests {
             memory,
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
+            FtsTuning::default(),
         );
 
         add_doc(&sender, 1, "should not be indexed").await;
@@ -984,6 +1008,7 @@ mod tests {
             memory,
             Duration::from_secs(3600),
             TEST_COMMIT_THRESHOLD,
+            FtsTuning::default(),
         );
         let (tx, mut rx) = mpsc::channel(1);
 
@@ -1005,6 +1030,20 @@ mod tests {
         let count = sender.count(make_index_key()).await.unwrap();
 
         assert_eq!(count, TEST_COMMIT_THRESHOLD);
+    }
+
+    #[rstest]
+    #[case(15_000_000)]
+    #[case(4_293_000_000)]
+    #[tokio::test]
+    async fn writer_accepts_the_configurable_memory_budget_bounds(#[case] bytes: usize) {
+        let tuning = FtsTuning {
+            writer_memory_bytes: bytes,
+        };
+
+        let state = IndexState::new(Analyzer::default(), Positions::default(), tuning);
+
+        assert!(state.is_ok(), "{bytes} bytes rejected: {:?}", state.err());
     }
 
     async fn highlight(
