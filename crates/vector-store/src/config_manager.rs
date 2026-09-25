@@ -6,6 +6,7 @@
 use crate::Config;
 use crate::Credentials;
 use crate::DiskannAlpha;
+use crate::FtsTuning;
 use crate::file_monitor::TlsFilesMonitor;
 use crate::tls;
 use crate::tls::TlsServerConfig;
@@ -16,12 +17,40 @@ use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::num::NonZeroUsize;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
 const DEFAULT_TLS_FILE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const TLS_FILE_CHECK_INTERVAL_ENV: &str = "VECTOR_STORE_TLS_FILE_CHECK_INTERVAL";
+
+const FTS_WRITER_MEMORY_MB_ENV: &str = "VECTOR_STORE_FTS_WRITER_MEMORY_MB";
+/// Tantivy refuses a per-thread budget below 15 MB or at `u32::MAX - 1 MB` bytes and above.
+const FTS_WRITER_MEMORY_MB_RANGE: RangeInclusive<usize> = 15..=4293;
+
+fn fts_writer_memory_bytes(env: &impl Fn(&str) -> anyhow::Result<String>) -> anyhow::Result<usize> {
+    let Ok(value) = env(FTS_WRITER_MEMORY_MB_ENV) else {
+        return Ok(FtsTuning::default().writer_memory_bytes);
+    };
+    let megabytes: usize = value.trim().parse().map_err(|err| {
+        anyhow!("Unable to parse {FTS_WRITER_MEMORY_MB_ENV} env (megabytes): {err}")
+    })?;
+    if !FTS_WRITER_MEMORY_MB_RANGE.contains(&megabytes) {
+        bail!(
+            "{FTS_WRITER_MEMORY_MB_ENV} must be within {}..={} megabytes, got {megabytes}",
+            FTS_WRITER_MEMORY_MB_RANGE.start(),
+            FTS_WRITER_MEMORY_MB_RANGE.end()
+        );
+    }
+    Ok(megabytes * 1_000_000)
+}
+
+fn fts_tuning(env: &impl Fn(&str) -> anyhow::Result<String>) -> anyhow::Result<FtsTuning> {
+    Ok(FtsTuning {
+        writer_memory_bytes: fts_writer_memory_bytes(env)?,
+    })
+}
 
 fn tls_file_check_interval(env: &impl Fn(&str) -> anyhow::Result<String>) -> Duration {
     match env(TLS_FILE_CHECK_INTERVAL_ENV) {
@@ -484,6 +513,8 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
     {
         config.fulltext_indexes = fulltext_indexes;
     }
+
+    config.fts_tuning = fts_tuning(&env)?;
 
     config.credentials = credentials(&env).await?;
 
@@ -1010,6 +1041,40 @@ mod tests {
                 .to_string()
                 .contains("Unable to parse VECTOR_STORE_DISKANN_MAX_POINTS")
         );
+    }
+
+    #[tokio::test]
+    async fn load_config_fts_writer_memory_defaults_to_256_mb() {
+        let env = mock_env(HashMap::new());
+        let config = load_config(env).await.unwrap();
+        assert_eq!(config.fts_tuning.writer_memory_bytes, 256_000_000);
+    }
+
+    #[rstest::rstest]
+    #[case("15", 15_000_000)]
+    #[case("1024", 1_024_000_000)]
+    #[case(" 4293 ", 4_293_000_000)]
+    #[tokio::test]
+    async fn load_config_fts_writer_memory_override(#[case] value: &str, #[case] bytes: usize) {
+        let env = mock_env(HashMap::from([(FTS_WRITER_MEMORY_MB_ENV, value.into())]));
+        let config = load_config(env).await.unwrap();
+        assert_eq!(config.fts_tuning.writer_memory_bytes, bytes);
+    }
+
+    #[rstest::rstest]
+    #[case("14", "must be within 15..=4293")]
+    #[case("4294", "must be within 15..=4293")]
+    #[case("0", "must be within 15..=4293")]
+    #[case("-1", "Unable to parse VECTOR_STORE_FTS_WRITER_MEMORY_MB")]
+    #[case("256MB", "Unable to parse VECTOR_STORE_FTS_WRITER_MEMORY_MB")]
+    #[tokio::test]
+    async fn load_config_fts_writer_memory_invalid_errors(
+        #[case] value: &str,
+        #[case] message: &str,
+    ) {
+        let env = mock_env(HashMap::from([(FTS_WRITER_MEMORY_MB_ENV, value.into())]));
+        let err = load_config(env).await.unwrap_err();
+        assert!(err.to_string().contains(message), "unexpected error: {err}");
     }
 
     #[test]
