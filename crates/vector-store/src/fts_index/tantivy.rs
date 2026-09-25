@@ -44,6 +44,7 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tracing::debug;
 use tracing::error;
+use tracing::info;
 
 use crate::Analyzer;
 use crate::AsyncInProgress;
@@ -259,10 +260,33 @@ fn commit(state: &IndexState, key: &IndexKey) {
         .writer
         .write()
         .unwrap()
-        .commit(|| state.reader.reload());
+        .commit(|| reload_reader(state, key, "commit"));
     if let Err(err) = result {
         error!("fts: failed to commit for {key}: {err}");
     }
+}
+
+fn reload_reader(state: &IndexState, key: &IndexKey, cause: &str) -> tantivy::Result<()> {
+    state.reader.reload()?;
+    log_served_segments(key, cause, &state.reader.searcher());
+    Ok(())
+}
+
+/// Logs the segments a reload made searchable, a count that does not depend on
+/// when the `fts_segment_count` gauge was last refreshed.
+fn log_served_segments(key: &IndexKey, cause: &str, searcher: &Searcher) {
+    let max_docs: Vec<u32> = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| segment.max_doc())
+        .collect();
+    info!(
+        "fts: reader reloaded after {cause} for {key}: {} segments, max_doc sum {} min {} max {}",
+        max_docs.len(),
+        max_docs.iter().copied().map(u64::from).sum::<u64>(),
+        max_docs.iter().min().unwrap_or(&0),
+        max_docs.iter().max().unwrap_or(&0),
+    );
 }
 
 /// Whether the reader still serves a segment set that background merges have replaced.
@@ -282,8 +306,13 @@ fn reader_misses_merges(state: &IndexState) -> tantivy::Result<bool> {
 }
 
 fn reload_after_merges(state: &IndexState, key: &IndexKey) {
-    let result = reader_misses_merges(state)
-        .and_then(|stale| if stale { state.reader.reload() } else { Ok(()) });
+    let result = reader_misses_merges(state).and_then(|stale| {
+        if stale {
+            reload_reader(state, key, "background merges")
+        } else {
+            Ok(())
+        }
+    });
     if let Err(err) = result {
         error!("fts: failed to reload reader after merges for {key}: {err}");
     }
