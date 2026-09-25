@@ -8,7 +8,10 @@ use std::collections::BTreeSet;
 use std::collections::btree_map::Entry;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -17,9 +20,11 @@ use tantivy::IndexWriter;
 use tantivy::ReloadPolicy;
 use tantivy::Searcher;
 use tantivy::SegmentOrdinal;
+use tantivy::SegmentReader;
 use tantivy::TantivyDocument;
 use tantivy::collector::TopDocs;
 use tantivy::columnar::Column;
+use tantivy::index::SegmentId;
 use tantivy::indexer::IndexWriterOptions;
 use tantivy::query::BooleanQuery;
 use tantivy::query::BoostQuery;
@@ -143,6 +148,7 @@ struct IndexState {
     index: tantivy::Index,
     writer: RwLock<Writer>,
     reader: tantivy::IndexReader,
+    primary_ids: PrimaryIdColumns,
     schema: Schema,
 }
 
@@ -175,6 +181,7 @@ impl IndexState {
                 uncommitted_docs_in_progress_guards: Vec::new(),
             }),
             reader,
+            primary_ids: PrimaryIdColumns::default(),
             schema,
         })
     }
@@ -268,6 +275,7 @@ fn commit(state: &IndexState, key: &IndexKey) {
 
 fn reload_reader(state: &IndexState, key: &IndexKey, cause: &str) -> tantivy::Result<()> {
     state.reader.reload()?;
+    state.primary_ids.refresh(&state.reader)?;
     log_served_segments(key, cause, &state.reader.searcher());
     Ok(())
 }
@@ -376,20 +384,84 @@ fn find_partition_id(
     Ok(partition_id)
 }
 
-/// Resolves search hits to their primary ids through the `primary_id` fast field.
+type SegmentColumns = BTreeMap<SegmentId, Column<u64>>;
+
+/// The `primary_id` fast-field column of every segment the reader serves.
 ///
-/// Reading the id from the column avoids decompressing a doc-store block per hit.
-/// Each segment's column is opened at most once per query.
-struct PrimaryIdColumns<'a> {
-    searcher: &'a Searcher,
-    columns: BTreeMap<SegmentOrdinal, Column<u64>>,
+/// Opening a column reads all of its block headers. Done per query for every segment
+/// a query hit, that took a third of the search CPU, so the columns are opened once,
+/// when a reader reload changes the served segments.
+#[derive(Default)]
+struct PrimaryIdColumns {
+    refresh: Mutex<()>,
+    served: RwLock<Arc<SegmentColumns>>,
+    misses: AtomicU64,
 }
 
-impl<'a> PrimaryIdColumns<'a> {
-    fn new(searcher: &'a Searcher) -> Self {
+impl PrimaryIdColumns {
+    /// Opens the columns of the segments the reader started serving and drops those of
+    /// the segments it no longer serves.
+    fn refresh(&self, reader: &tantivy::IndexReader) -> tantivy::Result<()> {
+        // Commits and merge reloads run on different workers; serializing their refreshes
+        // makes the columns of the newest searcher the ones stored last.
+        let _refresh = self.refresh.lock().unwrap();
+        let served = served_columns(&reader.searcher(), &self.snapshot())?;
+        *self.served.write().unwrap() = Arc::new(served);
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Arc<SegmentColumns> {
+        Arc::clone(&self.served.read().unwrap())
+    }
+
+    fn record_miss(&self, segment_id: SegmentId) {
+        let misses = self.misses.fetch_add(1, Ordering::Relaxed) + 1;
+        debug!(
+            "fts: primary_id column of segment {segment_id} not cached, opened for one query \
+             ({misses} misses so far)"
+        );
+    }
+}
+
+fn served_columns(searcher: &Searcher, cached: &SegmentColumns) -> tantivy::Result<SegmentColumns> {
+    searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| {
+            let segment_id = segment.segment_id();
+            let column = match cached.get(&segment_id) {
+                Some(column) => column.clone(),
+                None => open_primary_id_column(segment)?,
+            };
+            Ok((segment_id, column))
+        })
+        .collect()
+}
+
+fn open_primary_id_column(segment: &SegmentReader) -> tantivy::Result<Column<u64>> {
+    segment.fast_fields().u64("primary_id")
+}
+
+/// Resolves search hits to their primary ids through the cached `primary_id` columns.
+///
+/// Reading the id from the column avoids decompressing a doc-store block per hit.
+/// A searcher taken between a reader reload and the refresh of the columns that follows
+/// it can serve a segment the cache does not hold; that segment's column is opened at
+/// most once per query.
+struct HitPrimaryIds<'a> {
+    searcher: &'a Searcher,
+    columns: &'a PrimaryIdColumns,
+    cached: Arc<SegmentColumns>,
+    opened: BTreeMap<SegmentOrdinal, Column<u64>>,
+}
+
+impl<'a> HitPrimaryIds<'a> {
+    fn new(searcher: &'a Searcher, columns: &'a PrimaryIdColumns) -> Self {
         Self {
             searcher,
-            columns: BTreeMap::new(),
+            columns,
+            cached: columns.snapshot(),
+            opened: BTreeMap::new(),
         }
     }
 
@@ -401,24 +473,20 @@ impl<'a> PrimaryIdColumns<'a> {
     }
 
     fn column(&mut self, segment_ord: SegmentOrdinal) -> anyhow::Result<&Column<u64>> {
-        match self.columns.entry(segment_ord) {
+        let segment = self.searcher.segment_reader(segment_ord);
+        if let Some(column) = self.cached.get(&segment.segment_id()) {
+            return Ok(column);
+        }
+        match self.opened.entry(segment_ord) {
             Entry::Occupied(entry) => Ok(entry.into_mut()),
             Entry::Vacant(entry) => {
-                Ok(entry.insert(open_primary_id_column(self.searcher, segment_ord)?))
+                self.columns.record_miss(segment.segment_id());
+                let column = open_primary_id_column(segment)
+                    .map_err(|e| anyhow!("fts: failed to open primary_id column: {e}"))?;
+                Ok(entry.insert(column))
             }
         }
     }
-}
-
-fn open_primary_id_column(
-    searcher: &Searcher,
-    segment_ord: SegmentOrdinal,
-) -> anyhow::Result<Column<u64>> {
-    searcher
-        .segment_reader(segment_ord)
-        .fast_fields()
-        .u64("primary_id")
-        .map_err(|e| anyhow!("fts: failed to open primary_id column: {e}"))
 }
 
 fn handle_search(
@@ -441,7 +509,7 @@ fn handle_search(
     let table = table.read().unwrap();
     let partition_id = find_partition_id(table.deref(), index_key)?;
 
-    let mut primary_ids = PrimaryIdColumns::new(&searcher);
+    let mut primary_ids = HitPrimaryIds::new(&searcher, &state.primary_ids);
     let (primary_keys, scores) = top_docs
         .into_iter()
         .map(|(score, doc_address)| Ok((score, primary_ids.primary_id(doc_address)?)))
@@ -1277,6 +1345,63 @@ mod tests {
             sorted(search_state(&state, SHARED_TERM)),
             sorted((0..DOCS).map(primary_key).collect())
         );
+    }
+
+    fn cached_segment_ids(state: &IndexState) -> BTreeSet<SegmentId> {
+        state.primary_ids.snapshot().keys().cloned().collect()
+    }
+
+    fn primary_id_misses(state: &IndexState) -> u64 {
+        state.primary_ids.misses.load(Ordering::Relaxed)
+    }
+
+    fn all_primary_keys(ids: std::ops::Range<u64>) -> Vec<PrimaryKey> {
+        sorted(ids.map(primary_key).collect())
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn search_reads_primary_ids_from_columns_opened_at_commit() {
+        let state = IndexState::new(Analyzer::default(), Positions::default()).unwrap();
+        commit_segment_of_docs(&state, 0..4);
+        commit_segment_of_docs(&state, 4..8);
+        assert_eq!(cached_segment_ids(&state), served_segment_ids(&state));
+
+        assert_eq!(
+            sorted(search_state(&state, SHARED_TERM)),
+            all_primary_keys(0..8)
+        );
+        assert_eq!(primary_id_misses(&state), 0);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn reload_after_merges_caches_only_the_served_segments_columns() {
+        let state = IndexState::new(Analyzer::default(), Positions::default()).unwrap();
+        commit_segments(&state, MERGE_POLICY_MIN_NUM_SEGMENTS);
+        wait_for_merges(&state).await;
+        assert_ne!(cached_segment_ids(&state), searchable_segment_ids(&state));
+
+        reload_after_merges(&state, &make_index_key());
+
+        assert_eq!(cached_segment_ids(&state), searchable_segment_ids(&state));
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn search_opens_a_column_missing_from_the_cache_once_per_query() {
+        let state = IndexState::new(Analyzer::default(), Positions::default()).unwrap();
+        commit_segment_of_docs(&state, 0..4);
+        *state.primary_ids.served.write().unwrap() = Arc::default();
+
+        assert_eq!(
+            sorted(search_state(&state, SHARED_TERM)),
+            all_primary_keys(0..4)
+        );
+        assert_eq!(primary_id_misses(&state), 1);
     }
 
     async fn highlight(
