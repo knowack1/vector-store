@@ -5,29 +5,33 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::btree_map::Entry;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use tantivy::DocAddress;
 use tantivy::IndexWriter;
 use tantivy::ReloadPolicy;
+use tantivy::Searcher;
+use tantivy::SegmentOrdinal;
 use tantivy::TantivyDocument;
 use tantivy::collector::TopDocs;
+use tantivy::columnar::Column;
 use tantivy::indexer::IndexWriterOptions;
 use tantivy::query::BooleanQuery;
 use tantivy::query::BoostQuery;
 use tantivy::query::Occur;
 use tantivy::query::Query;
 use tantivy::query::QueryParser;
+use tantivy::schema::FAST;
 use tantivy::schema::INDEXED;
 use tantivy::schema::IndexRecordOption;
-use tantivy::schema::STORED;
 use tantivy::schema::Schema;
 use tantivy::schema::TextFieldIndexing;
 use tantivy::schema::TextOptions;
-use tantivy::schema::Value;
 use tantivy::snippet::SnippetGenerator;
 use tantivy::tokenizer::Language;
 use tantivy::tokenizer::LowerCaser;
@@ -234,7 +238,8 @@ fn body_text_options(tokenizer: &str, positions: Positions) -> TextOptions {
 
 fn build_schema(tokenizer: &str, positions: Positions) -> Schema {
     let mut schema_builder = Schema::builder();
-    schema_builder.add_u64_field("primary_id", INDEXED | STORED);
+    // INDEXED serves the delete-by-term of removals, FAST the hit-to-id lookup of searches.
+    schema_builder.add_u64_field("primary_id", INDEXED | FAST);
     schema_builder.add_text_field("body", body_text_options(tokenizer, positions));
     schema_builder.build()
 }
@@ -342,6 +347,51 @@ fn find_partition_id(
     Ok(partition_id)
 }
 
+/// Resolves search hits to their primary ids through the `primary_id` fast field.
+///
+/// Reading the id from the column avoids decompressing a doc-store block per hit.
+/// Each segment's column is opened at most once per query.
+struct PrimaryIdColumns<'a> {
+    searcher: &'a Searcher,
+    columns: BTreeMap<SegmentOrdinal, Column<u64>>,
+}
+
+impl<'a> PrimaryIdColumns<'a> {
+    fn new(searcher: &'a Searcher) -> Self {
+        Self {
+            searcher,
+            columns: BTreeMap::new(),
+        }
+    }
+
+    fn primary_id(&mut self, doc_address: DocAddress) -> anyhow::Result<PrimaryId> {
+        self.column(doc_address.segment_ord)?
+            .first(doc_address.doc_id)
+            .map(PrimaryId::from)
+            .ok_or_else(|| anyhow!("fts: missing primary_id in doc"))
+    }
+
+    fn column(&mut self, segment_ord: SegmentOrdinal) -> anyhow::Result<&Column<u64>> {
+        match self.columns.entry(segment_ord) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                Ok(entry.insert(open_primary_id_column(self.searcher, segment_ord)?))
+            }
+        }
+    }
+}
+
+fn open_primary_id_column(
+    searcher: &Searcher,
+    segment_ord: SegmentOrdinal,
+) -> anyhow::Result<Column<u64>> {
+    searcher
+        .segment_reader(segment_ord)
+        .fast_fields()
+        .u64("primary_id")
+        .map_err(|e| anyhow!("fts: failed to open primary_id column: {e}"))
+}
+
 fn handle_search(
     state: &IndexState,
     table: &RwLock<impl TableSearch>,
@@ -350,7 +400,6 @@ fn handle_search(
     limit: Limit,
 ) -> FtsSearchR {
     let body_field = state.schema.get_field("body").unwrap();
-    let primary_id_field = state.schema.get_field("primary_id").unwrap();
 
     let searcher = state.reader.searcher();
     let query = make_query(&state.index, body_field, query_str)?;
@@ -363,18 +412,10 @@ fn handle_search(
     let table = table.read().unwrap();
     let partition_id = find_partition_id(table.deref(), index_key)?;
 
+    let mut primary_ids = PrimaryIdColumns::new(&searcher);
     let (primary_keys, scores) = top_docs
         .into_iter()
-        .map(|(score, doc_address)| {
-            let doc: TantivyDocument = searcher
-                .doc(doc_address)
-                .map_err(|e| anyhow!("fts: failed to retrieve doc: {e}"))?;
-            let raw_id = doc
-                .get_first(primary_id_field)
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow!("fts: missing primary_id in doc"))?;
-            Ok((score, PrimaryId::from(raw_id)))
-        })
+        .map(|(score, doc_address)| Ok((score, primary_ids.primary_id(doc_address)?)))
         .collect::<anyhow::Result<Vec<_>>>()?
         .into_iter()
         .filter_map(|(score, primary_id)| {
