@@ -117,6 +117,29 @@ pub(crate) fn to_json(value: CqlValue) -> anyhow::Result<Value> {
     }
 }
 
+/// Serializes a primary key value to the same JSON as [`to_json`], writing the common
+/// key types straight to the serializer instead of building a [`Value`] first.
+pub(crate) struct JsonCqlValue<'a>(pub(crate) &'a CqlValue);
+
+impl serde::Serialize for JsonCqlValue<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            CqlValue::Ascii(value) | CqlValue::Text(value) => serializer.serialize_str(value),
+            CqlValue::Uuid(value) => serialize_uuid(value, serializer),
+            CqlValue::Timeuuid(value) => serialize_uuid(value.as_ref(), serializer),
+            CqlValue::Int(value) => serializer.serialize_i32(*value),
+            CqlValue::BigInt(value) => serializer.serialize_i64(*value),
+            value => to_json(value.clone())
+                .map_err(serde::ser::Error::custom)?
+                .serialize(serializer),
+        }
+    }
+}
+
+fn serialize_uuid<S: serde::Serializer>(value: &Uuid, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(value.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
+}
+
 pub(crate) fn from_json(value: Value, cql_type: &NativeType) -> anyhow::Result<CqlValue> {
     match value {
         Value::String(value) => match cql_type {
@@ -444,6 +467,46 @@ mod tests {
             )),
             other => panic!("sample_value: {other:?} is not in SUPPORTED"),
         }
+    }
+
+    fn assert_serializes_like_to_json(value: CqlValue) {
+        let direct = serde_json::to_value(JsonCqlValue(&value))
+            .unwrap_or_else(|err| panic!("{value:?}: JsonCqlValue: {err}"));
+        let via_value = to_json(value.clone()).unwrap_or_else(|err| panic!("{value:?}: {err}"));
+        assert_eq!(direct, via_value, "{value:?}");
+        assert_eq!(
+            serde_json::to_string(&JsonCqlValue(&value)).unwrap(),
+            serde_json::to_string(&via_value).unwrap(),
+            "{value:?}: serialized text"
+        );
+    }
+
+    #[test]
+    fn json_cql_value_serializes_every_supported_type_like_to_json() {
+        SUPPORTED
+            .iter()
+            .map(sample_value)
+            .for_each(assert_serializes_like_to_json);
+    }
+
+    #[test]
+    fn json_cql_value_serializes_edge_values_like_to_json() {
+        [
+            CqlValue::Text("quote \" backslash \\ newline \n tab \t ż".to_string()),
+            CqlValue::Ascii(String::new()),
+            CqlValue::Uuid(Uuid::max()),
+            CqlValue::Uuid(Uuid::nil()),
+            CqlValue::Int(i32::MIN),
+            CqlValue::BigInt(i64::MAX),
+        ]
+        .into_iter()
+        .for_each(assert_serializes_like_to_json);
+    }
+
+    #[test]
+    fn json_cql_value_fails_where_to_json_fails() {
+        assert!(to_json(CqlValue::Empty).is_err());
+        assert!(serde_json::to_value(JsonCqlValue(&CqlValue::Empty)).is_err());
     }
 
     #[test]

@@ -1118,22 +1118,17 @@ async fn post_index_bm25(
                 return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
             }
 
-            let primary_keys =
-                try_collect_primary_keys(primary_key_columns.as_slice(), &primary_keys);
-
-            match primary_keys {
+            let body = Bm25ResponseBody {
+                primary_key_columns: primary_key_columns.as_slice(),
+                primary_keys: &primary_keys,
+                scores: &scores,
+            };
+            match body.check_primary_key_sizes() {
                 Err(err) => {
                     debug!("post_index_bm25: {err}");
                     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
                 }
-                Ok(primary_keys) => (
-                    StatusCode::OK,
-                    response::Json(httpapi::PostIndexBm25Response {
-                        primary_keys,
-                        scores,
-                    }),
-                )
-                    .into_response(),
+                Ok(()) => (StatusCode::OK, response::Json(body)).into_response(),
             }
         }
     }
@@ -1444,6 +1439,73 @@ fn check_insecure_tls(
     None
 }
 
+/// Serializes to the same JSON as [`httpapi::PostIndexBm25Response`] built with
+/// [`try_collect_primary_keys`], writing the primary keys straight into the response
+/// instead of first building a map of `serde_json::Value` trees.
+struct Bm25ResponseBody<'a> {
+    primary_key_columns: &'a [crate::ColumnName],
+    primary_keys: &'a [crate::PrimaryKey],
+    scores: &'a [f32],
+}
+
+struct PrimaryKeyColumns<'a>(&'a Bm25ResponseBody<'a>);
+
+struct PrimaryKeyColumn<'a> {
+    idx_column: usize,
+    primary_keys: &'a [crate::PrimaryKey],
+}
+
+impl Bm25ResponseBody<'_> {
+    fn check_primary_key_sizes(&self) -> anyhow::Result<()> {
+        let columns = self.primary_key_columns.len();
+        match self.primary_keys.iter().find(|key| key.len() != columns) {
+            Some(key) => bail!("wrong size of a primary key: {columns}, {}", key.len()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl serde::Serialize for Bm25ResponseBody<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("primary_keys", &PrimaryKeyColumns(self))?;
+        map.serialize_entry("scores", self.scores)?;
+        map.end()
+    }
+}
+
+impl serde::Serialize for PrimaryKeyColumns<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let columns = self.0.primary_key_columns;
+        let mut map = serializer.serialize_map(Some(columns.len()))?;
+        for (idx_column, column) in columns.iter().enumerate() {
+            let column: &str = column.as_ref();
+            let values = PrimaryKeyColumn {
+                idx_column,
+                primary_keys: self.0.primary_keys,
+            };
+            map.serialize_entry(column, &values)?;
+        }
+        map.end()
+    }
+}
+
+impl serde::Serialize for PrimaryKeyColumn<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.primary_keys.len()))?;
+        for primary_key in self.primary_keys {
+            let value = primary_key.get(self.idx_column).ok_or_else(|| {
+                serde::ser::Error::custom("primary key index out of bounds after length check")
+            })?;
+            seq.serialize_element(&cql_types::JsonCqlValue(&value))?;
+        }
+        seq.end()
+    }
+}
+
 fn try_collect_primary_keys(
     primary_key_columns: &[crate::ColumnName],
     primary_keys: &[crate::PrimaryKey],
@@ -1584,6 +1646,104 @@ mod tests {
 
     use super::*;
     use crate::Analyzer;
+
+    fn bm25_response_via_value(
+        primary_key_columns: &[crate::ColumnName],
+        primary_keys: &[crate::PrimaryKey],
+        scores: &[f32],
+    ) -> httpapi::PostIndexBm25Response {
+        httpapi::PostIndexBm25Response {
+            primary_keys: try_collect_primary_keys(primary_key_columns, primary_keys).unwrap(),
+            scores: scores.to_vec(),
+        }
+    }
+
+    fn sample_primary_keys() -> Vec<crate::PrimaryKey> {
+        (0..3)
+            .map(|i| {
+                [
+                    CqlValue::Uuid(uuid::Uuid::from_u128(0x0a60_5883 + i)),
+                    CqlValue::Text(format!("title \"{i}\"")),
+                    CqlValue::BigInt(i as i64 - 1),
+                ]
+                .into_iter()
+                .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bm25_response_body_serializes_like_post_index_bm25_response() {
+        let columns: Vec<crate::ColumnName> = vec!["id".into(), "title".into(), "ts".into()];
+        let primary_keys = sample_primary_keys();
+        let scores = [19.250362, 16.006615, 0.5];
+        let body = Bm25ResponseBody {
+            primary_key_columns: &columns,
+            primary_keys: &primary_keys,
+            scores: &scores,
+        };
+
+        body.check_primary_key_sizes().unwrap();
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::to_value(bm25_response_via_value(&columns, &primary_keys, &scores))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn bm25_response_body_with_one_column_serializes_to_the_same_text() {
+        let columns: Vec<crate::ColumnName> = vec!["article_id".into()];
+        let primary_keys: Vec<crate::PrimaryKey> = (0..5)
+            .map(|i| {
+                [CqlValue::Uuid(uuid::Uuid::from_u128(i))]
+                    .into_iter()
+                    .collect()
+            })
+            .collect();
+        let scores = [19.250362, 16.006615, 15.500248, 14.362967, 13.068089];
+        let body = Bm25ResponseBody {
+            primary_key_columns: &columns,
+            primary_keys: &primary_keys,
+            scores: &scores,
+        };
+
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            serde_json::to_string(&bm25_response_via_value(&columns, &primary_keys, &scores))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn bm25_response_body_without_hits_serializes_empty_columns() {
+        let columns: Vec<crate::ColumnName> = vec!["article_id".into()];
+        let body = Bm25ResponseBody {
+            primary_key_columns: &columns,
+            primary_keys: &[],
+            scores: &[],
+        };
+
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"primary_keys":{"article_id":[]},"scores":[]}"#
+        );
+    }
+
+    #[test]
+    fn bm25_response_body_rejects_a_primary_key_of_the_wrong_size() {
+        let columns: Vec<crate::ColumnName> = vec!["id".into(), "title".into()];
+        let primary_keys = sample_primary_keys();
+        let body = Bm25ResponseBody {
+            primary_key_columns: &columns,
+            primary_keys: &primary_keys,
+            scores: &[1.0, 2.0, 3.0],
+        };
+
+        let err = body.check_primary_key_sizes().unwrap_err();
+        let old_err = try_collect_primary_keys(&columns, &primary_keys).unwrap_err();
+        assert_eq!(err.to_string(), old_err.to_string());
+    }
 
     #[test]
     fn try_from_post_index_ann_filter_conversion_ok() {
