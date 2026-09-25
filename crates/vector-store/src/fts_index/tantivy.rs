@@ -40,6 +40,7 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tracing::debug;
 use tracing::error;
+use tracing::info;
 
 use crate::Analyzer;
 use crate::AsyncInProgress;
@@ -276,9 +277,21 @@ fn reader_misses_merges(state: &IndexState) -> tantivy::Result<bool> {
     Ok(served != searchable)
 }
 
+fn reload_merged_segments(state: &IndexState, key: &IndexKey) -> tantivy::Result<()> {
+    state.reader.reload()?;
+    let served = state.reader.searcher().segment_readers().len();
+    info!("fts: reloaded reader for {key} after merges, serving {served} segments");
+    Ok(())
+}
+
 fn reload_after_merges(state: &IndexState, key: &IndexKey) {
-    let result = reader_misses_merges(state)
-        .and_then(|stale| if stale { state.reader.reload() } else { Ok(()) });
+    let result = reader_misses_merges(state).and_then(|stale| {
+        if stale {
+            reload_merged_segments(state, key)
+        } else {
+            Ok(())
+        }
+    });
     if let Err(err) = result {
         error!("fts: failed to reload reader after merges for {key}: {err}");
     }
