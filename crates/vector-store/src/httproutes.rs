@@ -35,11 +35,11 @@ use crate::vs_index;
 use crate::vs_index::VsIndexSearch;
 use crate::vs_index::VsIndexSearchExt;
 use anyhow::bail;
+use axum::Extension;
 use axum::Router;
 use axum::extract;
 use axum::extract::Path;
 use axum::extract::State;
-use axum::http::Extensions;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
@@ -773,14 +773,14 @@ If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
 #[hotpath::measure]
 async fn post_index_ann(
     State(state): State<RoutesInnerState>,
-    extensions: Extensions,
+    protocol: Option<Extension<Protocol>>,
     Path((keyspace, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
     extract::Json(request): extract::Json<httpapi::PostIndexAnnRequest>,
 ) -> Response {
     perf::hotpath_async(async move {
         let keyspace: crate::KeyspaceName = keyspace.into();
         let index_name: crate::IndexName = index_name.into();
-        if let Some(resp) = check_insecure_tls(state.use_tls, &extensions, "post_index_ann") {
+        if let Some(resp) = check_insecure_tls(state.use_tls, protocol, "post_index_ann") {
             return resp;
         }
 
@@ -1039,13 +1039,13 @@ If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
 )]
 async fn post_index_bm25(
     State(state): State<RoutesInnerState>,
-    extensions: Extensions,
+    protocol: Option<Extension<Protocol>>,
     Path((keyspace, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
     extract::Json(request): extract::Json<httpapi::PostIndexBm25Request>,
 ) -> Response {
     let keyspace: crate::KeyspaceName = keyspace.into();
     let index_name: crate::IndexName = index_name.into();
-    if let Some(resp) = check_insecure_tls(state.use_tls, &extensions, "post_index_bm25") {
+    if let Some(resp) = check_insecure_tls(state.use_tls, protocol, "post_index_bm25") {
         return resp;
     }
 
@@ -1192,13 +1192,13 @@ If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
 )]
 async fn post_index_highlight(
     State(state): State<RoutesInnerState>,
-    extensions: Extensions,
+    protocol: Option<Extension<Protocol>>,
     Path((keyspace, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
     extract::Json(request): extract::Json<httpapi::PostIndexHighlightRequest>,
 ) -> Response {
     let keyspace: crate::KeyspaceName = keyspace.into();
     let index_name: crate::IndexName = index_name.into();
-    if let Some(resp) = check_insecure_tls(state.use_tls, &extensions, "post_index_highlight") {
+    if let Some(resp) = check_insecure_tls(state.use_tls, protocol, "post_index_highlight") {
         return resp;
     }
 
@@ -1431,14 +1431,10 @@ fn try_from_post_index_ann_filter(
 
 fn check_insecure_tls(
     use_tls: bool,
-    extensions: &Extensions,
+    protocol: Option<Extension<Protocol>>,
     route_name: &str,
 ) -> Option<Response> {
-    if use_tls
-        && extensions
-            .get::<Protocol>()
-            .is_some_and(|protocol| *protocol == Protocol::Plain)
-    {
+    if use_tls && protocol.is_some_and(|Extension(protocol)| protocol == Protocol::Plain) {
         let msg = "TLS is required, but the request \
             was made over an insecure connection."
             .to_string();
