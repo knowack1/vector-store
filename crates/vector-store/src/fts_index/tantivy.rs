@@ -1007,6 +1007,55 @@ mod tests {
         assert_eq!(count, TEST_COMMIT_THRESHOLD);
     }
 
+    /// Tantivy's default `LogMergePolicy` merges once this many same-level segments exist.
+    const MERGE_POLICY_MIN_NUM_SEGMENTS: u64 = 8;
+    const MERGE_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn add_committed_segment(sender: &mpsc::Sender<FtsIndex>, segment: u64) {
+        let (tx, mut rx) = mpsc::channel(1);
+        let docs_per_segment = TEST_COMMIT_THRESHOLD as u64;
+        for doc in 0..docs_per_segment {
+            sender
+                .add_document(
+                    (segment * docs_per_segment + doc).into(),
+                    format!("segment {segment} document {doc} body text"),
+                    AsyncInProgress::Fullscan(tx.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        drop(tx);
+        rx.recv().await;
+    }
+
+    async fn segment_count(sender: &mpsc::Sender<FtsIndex>) -> usize {
+        sender.stats(make_index_key()).await.unwrap().segment_count
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn reader_drops_merged_away_segments_without_further_writes() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+
+        // The last commit leaves exactly enough segments to start a background merge, which
+        // finishes after that commit has already reloaded the reader.
+        for segment in 0..MERGE_POLICY_MIN_NUM_SEGMENTS {
+            add_committed_segment(&sender, segment).await;
+        }
+
+        let deadline = tokio::time::Instant::now() + MERGE_SETTLE_TIMEOUT;
+        while segment_count(&sender).await as u64 >= MERGE_POLICY_MIN_NUM_SEGMENTS {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "reader still serves {} segments after the background merge",
+                segment_count(&sender).await
+            );
+            tokio::time::sleep(TEST_COMMIT_INTERVAL).await;
+        }
+    }
+
     async fn highlight(
         sender: &mpsc::Sender<FtsIndex>,
         query: &str,
