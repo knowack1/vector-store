@@ -206,16 +206,24 @@ pub struct FtsTuning {
     /// Tantivy's indexing buffer per writer thread, in bytes. A thread flushes its
     /// segment as soon as the buffer is full, so a small budget means many small segments.
     pub writer_memory_bytes: usize,
+    /// Once the initial full scan has finished, merge the index down to at most this many
+    /// segments. `None` leaves the segment count to tantivy's merge policy alone.
+    ///
+    /// Kept below the merge policy's minimum of 8 segments per merge, which would otherwise
+    /// merge all the consolidated, equally sized segments into one at its next opportunity.
+    pub target_segments: Option<NonZeroUsize>,
 }
 
 impl FtsTuning {
     pub const DEFAULT_WRITER_MEMORY_MB: usize = 256;
+    pub const DEFAULT_TARGET_SEGMENTS: NonZeroUsize = NonZeroUsize::new(6).unwrap();
 }
 
 impl Default for FtsTuning {
     fn default() -> Self {
         Self {
             writer_memory_bytes: Self::DEFAULT_WRITER_MEMORY_MB * 1_000_000,
+            target_segments: Some(Self::DEFAULT_TARGET_SEGMENTS),
         }
     }
 }

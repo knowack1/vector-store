@@ -46,9 +46,34 @@ fn fts_writer_memory_bytes(env: &impl Fn(&str) -> anyhow::Result<String>) -> any
     Ok(megabytes * 1_000_000)
 }
 
+const FTS_TARGET_SEGMENTS_ENV: &str = "VECTOR_STORE_FTS_TARGET_SEGMENTS";
+/// `0` disables the post-scan consolidation; 8 is where tantivy's merge policy would merge
+/// the consolidated segments back into one.
+const FTS_TARGET_SEGMENTS_RANGE: RangeInclusive<usize> = 0..=7;
+
+fn fts_target_segments(
+    env: &impl Fn(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<Option<NonZeroUsize>> {
+    let Ok(value) = env(FTS_TARGET_SEGMENTS_ENV) else {
+        return Ok(FtsTuning::default().target_segments);
+    };
+    let segments: usize = value.trim().parse().map_err(|err| {
+        anyhow!("Unable to parse {FTS_TARGET_SEGMENTS_ENV} env (segment count, 0 disables): {err}")
+    })?;
+    if !FTS_TARGET_SEGMENTS_RANGE.contains(&segments) {
+        bail!(
+            "{FTS_TARGET_SEGMENTS_ENV} must be within {}..={} segments, got {segments}",
+            FTS_TARGET_SEGMENTS_RANGE.start(),
+            FTS_TARGET_SEGMENTS_RANGE.end()
+        );
+    }
+    Ok(NonZeroUsize::new(segments))
+}
+
 fn fts_tuning(env: &impl Fn(&str) -> anyhow::Result<String>) -> anyhow::Result<FtsTuning> {
     Ok(FtsTuning {
         writer_memory_bytes: fts_writer_memory_bytes(env)?,
+        target_segments: fts_target_segments(env)?,
     })
 }
 
@@ -1073,6 +1098,43 @@ mod tests {
         #[case] message: &str,
     ) {
         let env = mock_env(HashMap::from([(FTS_WRITER_MEMORY_MB_ENV, value.into())]));
+        let err = load_config(env).await.unwrap_err();
+        assert!(err.to_string().contains(message), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn load_config_fts_target_segments_defaults_to_6() {
+        let env = mock_env(HashMap::new());
+        let config = load_config(env).await.unwrap();
+        assert_eq!(config.fts_tuning.target_segments, NonZeroUsize::new(6));
+    }
+
+    #[rstest::rstest]
+    #[case("1", NonZeroUsize::new(1))]
+    #[case(" 4 ", NonZeroUsize::new(4))]
+    #[case("7", NonZeroUsize::new(7))]
+    #[case("0", None)]
+    #[tokio::test]
+    async fn load_config_fts_target_segments_override(
+        #[case] value: &str,
+        #[case] expected: Option<NonZeroUsize>,
+    ) {
+        let env = mock_env(HashMap::from([(FTS_TARGET_SEGMENTS_ENV, value.into())]));
+        let config = load_config(env).await.unwrap();
+        assert_eq!(config.fts_tuning.target_segments, expected);
+    }
+
+    #[rstest::rstest]
+    #[case("8", "must be within 0..=7")]
+    #[case("100", "must be within 0..=7")]
+    #[case("-1", "Unable to parse VECTOR_STORE_FTS_TARGET_SEGMENTS")]
+    #[case("eight", "Unable to parse VECTOR_STORE_FTS_TARGET_SEGMENTS")]
+    #[tokio::test]
+    async fn load_config_fts_target_segments_invalid_errors(
+        #[case] value: &str,
+        #[case] message: &str,
+    ) {
+        let env = mock_env(HashMap::from([(FTS_TARGET_SEGMENTS_ENV, value.into())]));
         let err = load_config(env).await.unwrap_err();
         assert!(err.to_string().contains(message), "unexpected error: {err}");
     }

@@ -4,6 +4,7 @@
  */
 
 mod actor;
+mod consolidation;
 mod factory;
 mod tantivy;
 
