@@ -22,6 +22,7 @@ use tantivy::DocAddress;
 use tantivy::FutureResult;
 use tantivy::IndexWriter;
 use tantivy::ReloadPolicy;
+use tantivy::Score;
 use tantivy::Searcher;
 use tantivy::SegmentOrdinal;
 use tantivy::SegmentReader;
@@ -39,6 +40,7 @@ use tantivy::query::BoostQuery;
 use tantivy::query::Occur;
 use tantivy::query::Query;
 use tantivy::query::QueryParser;
+use tantivy::query::TermQuery;
 use tantivy::schema::FAST;
 use tantivy::schema::INDEXED;
 use tantivy::schema::IndexRecordOption;
@@ -85,6 +87,7 @@ use super::actor::FtsSearchR;
 use super::actor::FtsStats;
 use super::actor::FtsStatsR;
 use super::consolidation;
+use super::term_top_k;
 
 pub(crate) struct TantivyIndexFactory {
     worker: async_channel::Sender<Worker>,
@@ -664,8 +667,7 @@ fn handle_search(
     let query = make_query(&state.index, body_field, query_str)?;
     let limit: usize = (*limit.as_ref()).into();
 
-    let top_docs = searcher
-        .search(&query, &TopDocs::with_limit(limit).order_by_score())
+    let top_docs = top_docs(&searcher, query.as_ref(), limit)
         .map_err(|e| anyhow!("fts: search failed: {e}"))?;
 
     let table = table.read().unwrap();
@@ -685,6 +687,25 @@ fn handle_search(
         .unzip();
 
     Ok((primary_keys, scores))
+}
+
+fn top_docs(
+    searcher: &Searcher,
+    query: &dyn Query,
+    limit: usize,
+) -> tantivy::Result<Vec<(Score, DocAddress)>> {
+    match single_term(searcher, query) {
+        Some(term) => term_top_k::search(searcher, term, limit),
+        None => searcher.search(query, &TopDocs::with_limit(limit).order_by_score()),
+    }
+}
+
+/// The term of a query that is a single term BM25 can score.
+fn single_term<'q>(searcher: &Searcher, query: &'q dyn Query) -> Option<&'q tantivy::Term> {
+    query
+        .downcast_ref::<TermQuery>()
+        .map(TermQuery::term)
+        .filter(|term| term_top_k::supports(searcher, term.field()))
 }
 
 const HIGHLIGHT_MAX_NUM_CHARS: usize = 150;

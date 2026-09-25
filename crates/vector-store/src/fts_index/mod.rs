@@ -7,6 +7,7 @@ mod actor;
 mod consolidation;
 mod factory;
 mod tantivy;
+mod term_top_k;
 
 use crate::FtsTuning;
 use crate::memory::Memory;
