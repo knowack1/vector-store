@@ -114,8 +114,20 @@ use utoipa_swagger_ui::SwaggerUi;
 // TODO: modify HTTP API after design
 struct ApiDoc;
 
+/// Axum clones the router state for every request; one `Arc` makes that a single
+/// reference-count increment instead of a copy of every sender and the version string.
 #[derive(Clone)]
-struct RoutesInnerState {
+struct RoutesInnerState(Arc<RoutesInner>);
+
+impl std::ops::Deref for RoutesInnerState {
+    type Target = RoutesInner;
+
+    fn deref(&self) -> &RoutesInner {
+        &self.0
+    }
+}
+
+struct RoutesInner {
     engine: Sender<Engine>,
     indexes: Arc<RwLock<Indexes>>,
     metrics: Arc<Metrics>,
@@ -134,7 +146,7 @@ pub(crate) async fn new(
     index_engine_version: String,
     use_tls: bool,
 ) -> Router {
-    let state = RoutesInnerState {
+    let state = RoutesInnerState(Arc::new(RoutesInner {
         engine,
         indexes,
         metrics: metrics.clone(),
@@ -142,7 +154,7 @@ pub(crate) async fn new(
         internals,
         index_engine_version,
         use_tls,
-    };
+    }));
     let (router, api) = new_open_api_router();
     let router = router
         .route("/metrics", get(get_metrics))
