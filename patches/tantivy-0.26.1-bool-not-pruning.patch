@@ -1,0 +1,803 @@
+# Block-max top-K pruning for boolean queries with MustNot clauses, Tantivy 0.26.1
+# Base: tantivy 0.26.1 (crates.io) plus tantivy-0.26.1-phrase-pruning.patch
+# A term include (`a NOT b`, `+a -b`) runs block_wand_single_scorer and a term-union
+# include (`a OR b NOT c`) runs block_wand; the exclusion set filters the callback.
+# Apply after the phrase patch with: git apply -p1 tantivy-0.26.1-bool-not-pruning.patch
+
+diff --git a/src/query/boolean_query/block_wand.rs b/src/query/boolean_query/block_wand.rs
+index 6b2f2d6..76ec258 100644
+--- a/src/query/boolean_query/block_wand.rs
++++ b/src/query/boolean_query/block_wand.rs
+@@ -305,9 +305,15 @@ mod tests {
+ 
+     use proptest::prelude::*;
+ 
++    use std::collections::BTreeSet;
++
++    use crate::collector::sort_key::NaturalComparator;
++    use crate::collector::TopNComputer;
++    use crate::query::boolean_query::excluding_pruner::assert_same_top_k;
++    use crate::query::boolean_query::{for_each_pruning_excluding, PrunableInclude};
+     use crate::query::score_combiner::SumCombiner;
+     use crate::query::term_query::TermScorer;
+-    use crate::query::{Bm25Weight, BufferedUnionScorer, Scorer};
++    use crate::query::{Bm25Weight, BufferedUnionScorer, Exclude, Scorer, VecDocSet};
+     use crate::{DocId, DocSet, Score, TERMINATED};
+ 
+     struct Float(Score);
+@@ -432,10 +438,14 @@ mod tests {
+             .boxed()
+     }
+ 
+-    fn test_block_wand_aux(posting_lists: &[Vec<(DocId, u32)>], fieldnorms: &[u32]) {
+-        // We virtually repeat all docs 64 times in order to emulate blocks of 2 documents
+-        // and surface blogs more easily.
+-        const REPEAT: usize = 64;
++    // We virtually repeat all docs 64 times in order to emulate blocks of 2 documents
++    // and surface blogs more easily.
++    const REPEAT: usize = 64;
++
++    fn expanded_term_scorers(
++        posting_lists: &[Vec<(DocId, u32)>],
++        fieldnorms: &[u32],
++    ) -> (Vec<TermScorer>, usize) {
+         let fieldnorms_expanded = fieldnorms
+             .iter()
+             .cloned()
+@@ -479,6 +489,11 @@ mod tests {
+                 TermScorer::create_for_test(postings, &fieldnorms_expanded[..], bm25_weight)
+             })
+             .collect();
++        (term_scorers, max_doc)
++    }
++
++    fn test_block_wand_aux(posting_lists: &[Vec<(DocId, u32)>], fieldnorms: &[u32]) {
++        let (term_scorers, max_doc) = expanded_term_scorers(posting_lists, fieldnorms);
+         for top_k in 1..4 {
+             let checkpoints_for_each_pruning =
+                 compute_checkpoints_for_each_pruning(term_scorers.clone(), top_k);
+@@ -511,6 +526,118 @@ mod tests {
+         }
+     }
+ 
++    const EXCLUDING_TOP_KS: [usize; 4] = [1, 5, 10, 1000];
++
++    /// The exclusion set mixes the high-frequency first copy of some documents, which holds
++    /// the best scores, with arbitrary expanded documents.
++    #[expect(clippy::type_complexity)]
++    fn gen_term_scorers_and_exclusion(
++        num_scorers: usize,
++    ) -> BoxedStrategy<(Vec<Vec<(DocId, u32)>>, Vec<u32>, Vec<DocId>)> {
++        (1u32..100u32)
++            .prop_flat_map(move |max_doc: u32| {
++                let expanded_max_doc = max_doc * REPEAT as u32;
++                (
++                    proptest::collection::vec(posting_list(max_doc), num_scorers),
++                    proptest::collection::vec(2u32..10u32 * MAX_TERM_FREQ, max_doc as usize),
++                    proptest::collection::btree_set(0..max_doc, 0..=max_doc as usize),
++                    proptest::collection::btree_set(
++                        0..expanded_max_doc,
++                        0..=expanded_max_doc as usize / 2,
++                    ),
++                )
++            })
++            .prop_map(
++                |(posting_lists, fieldnorms, excluded_first_copies, excluded_any)| {
++                    let exclusion: BTreeSet<DocId> = excluded_first_copies
++                        .into_iter()
++                        .map(|doc| doc * REPEAT as u32)
++                        .chain(excluded_any)
++                        .collect();
++                    (posting_lists, fieldnorms, exclusion.into_iter().collect())
++                },
++            )
++            .boxed()
++    }
++
++    fn into_sorted_hits(
++        top_n: TopNComputer<Score, DocId, NaturalComparator>,
++    ) -> Vec<(Score, DocId)> {
++        top_n
++            .into_sorted_vec()
++            .into_iter()
++            .map(|hit| (hit.sort_key, hit.doc))
++            .collect()
++    }
++
++    fn top_k_excluding_pruned(
++        mut term_scorers: Vec<TermScorer>,
++        exclusion: &[DocId],
++        k: usize,
++    ) -> Vec<(Score, DocId)> {
++        let include = if term_scorers.len() == 1 {
++            PrunableInclude::SingleTerm(Box::new(term_scorers.pop().unwrap()))
++        } else {
++            PrunableInclude::TermUnion(term_scorers)
++        };
++        let mut top_n = TopNComputer::new_with_comparator(k, NaturalComparator);
++        let exclusion = VecDocSet::from(exclusion.to_vec());
++        for_each_pruning_excluding(include, exclusion, Score::MIN, &mut |doc, score| {
++            top_n.push(score, doc);
++            top_n.threshold.unwrap_or(Score::MIN)
++        });
++        into_sorted_hits(top_n)
++    }
++
++    fn top_k_excluding_naive(
++        term_scorers: Vec<TermScorer>,
++        exclusion: &[DocId],
++        k: usize,
++        max_doc: usize,
++    ) -> Vec<(Score, DocId)> {
++        let union = BufferedUnionScorer::build(term_scorers, SumCombiner::default, max_doc as u32);
++        let mut scorer = Exclude::new(union, VecDocSet::from(exclusion.to_vec()));
++        let mut top_n = TopNComputer::new_with_comparator(k, NaturalComparator);
++        while scorer.doc() != TERMINATED {
++            top_n.push(scorer.score(), scorer.doc());
++            scorer.advance();
++        }
++        into_sorted_hits(top_n)
++    }
++
++    fn test_block_wand_excluding_aux(
++        posting_lists: &[Vec<(DocId, u32)>],
++        fieldnorms: &[u32],
++        exclusion: &[DocId],
++    ) {
++        let (term_scorers, max_doc) = expanded_term_scorers(posting_lists, fieldnorms);
++        for k in EXCLUDING_TOP_KS {
++            let pruned = top_k_excluding_pruned(term_scorers.clone(), exclusion, k);
++            let naive = top_k_excluding_naive(term_scorers.clone(), exclusion, k, max_doc);
++            assert_same_top_k(&pruned, &naive, k, &format!("k={k}"));
++        }
++    }
++
++    proptest! {
++        #![proptest_config(ProptestConfig::with_cases(500))]
++        #[test]
++        fn test_block_wand_excluding_single_term_scorer(
++            (posting_lists, fieldnorms, exclusion) in gen_term_scorers_and_exclusion(1)
++        ) {
++            test_block_wand_excluding_aux(&posting_lists[..], &fieldnorms[..], &exclusion[..]);
++        }
++    }
++
++    proptest! {
++        #![proptest_config(ProptestConfig::with_cases(500))]
++        #[test]
++        fn test_block_wand_excluding_two_term_scorers(
++            (posting_lists, fieldnorms, exclusion) in gen_term_scorers_and_exclusion(2)
++        ) {
++            test_block_wand_excluding_aux(&posting_lists[..], &fieldnorms[..], &exclusion[..]);
++        }
++    }
++
+     #[test]
+     fn test_fn_reproduce_proptest() {
+         let postings_lists = &[
+diff --git a/src/query/boolean_query/boolean_weight.rs b/src/query/boolean_query/boolean_weight.rs
+index 062449b..6c5aedd 100644
+--- a/src/query/boolean_query/boolean_weight.rs
++++ b/src/query/boolean_query/boolean_weight.rs
+@@ -9,16 +9,76 @@ use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
+ use crate::query::term_query::TermScorer;
+ use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
+ use crate::query::{
+-    intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, Explanation, Occur,
++    intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Explanation, Occur,
+     RequiredOptionalScorer, Scorer, Weight,
+ };
+ use crate::{DocId, Score};
+ 
++use super::{for_each_pruning_excluding, ExclusionScorers, PrunableInclude};
++
+ enum SpecializedScorer {
+     TermUnion(Vec<TermScorer>),
+     Other(Box<dyn Scorer>),
+ }
+ 
++/// The include part of a boolean query and its `MustNot` scorers, before they are
++/// combined into an `Exclude`.
++struct ScorerParts {
++    include: SpecializedScorer,
++    exclude: Vec<Box<dyn Scorer>>,
++}
++
++impl ScorerParts {
++    fn empty() -> ScorerParts {
++        ScorerParts {
++            include: SpecializedScorer::Other(Box::new(EmptyScorer)),
++            exclude: Vec::new(),
++        }
++    }
++
++    fn into_specialized_scorer<TScoreCombiner: ScoreCombiner>(
++        self,
++        score_combiner_fn: impl Fn() -> TScoreCombiner,
++        num_docs: u32,
++    ) -> SpecializedScorer {
++        if self.exclude.is_empty() {
++            return self.include;
++        }
++        let include_scorer_boxed = into_box_scorer(self.include, score_combiner_fn, num_docs);
++        let exclusion = ExclusionScorers::new(self.exclude);
++        SpecializedScorer::Other(exclusion.exclude_from(include_scorer_boxed))
++    }
++
++    /// Splits off a block-max prunable include when there is something to exclude.
++    /// Returns the parts unchanged otherwise.
++    fn into_excluding_pruner(self) -> Result<(PrunableInclude, ExclusionScorers), ScorerParts> {
++        if self.exclude.is_empty() {
++            return Err(self);
++        }
++        match prunable_include(self.include) {
++            Ok(include) => Ok((include, ExclusionScorers::new(self.exclude))),
++            Err(include) => Err(ScorerParts {
++                include,
++                exclude: self.exclude,
++            }),
++        }
++    }
++}
++
++/// Block-max scores are only meaningful when term frequencies are read.
++fn prunable_include(include: SpecializedScorer) -> Result<PrunableInclude, SpecializedScorer> {
++    match include {
++        SpecializedScorer::TermUnion(term_scorers) => Ok(PrunableInclude::TermUnion(term_scorers)),
++        SpecializedScorer::Other(scorer) => match scorer.downcast::<TermScorer>() {
++            Ok(term_scorer) if term_scorer.freq_reading_option() == FreqReadingOption::ReadFreq => {
++                Ok(PrunableInclude::SingleTerm(term_scorer))
++            }
++            Ok(term_scorer) => Err(SpecializedScorer::Other(term_scorer)),
++            Err(scorer) => Err(SpecializedScorer::Other(scorer)),
++        },
++    }
++}
++
+ fn scorer_disjunction<TScoreCombiner>(
+     scorers: Vec<Box<dyn Scorer>>,
+     score_combiner: TScoreCombiner,
+@@ -225,6 +285,16 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
+         boost: Score,
+         score_combiner_fn: impl Fn() -> TComplexScoreCombiner,
+     ) -> crate::Result<SpecializedScorer> {
++        let parts = self.complex_scorer_parts(reader, boost, &score_combiner_fn)?;
++        Ok(parts.into_specialized_scorer(score_combiner_fn, reader.num_docs()))
++    }
++
++    fn complex_scorer_parts<TComplexScoreCombiner: ScoreCombiner>(
++        &self,
++        reader: &SegmentReader,
++        boost: Score,
++        score_combiner_fn: impl Fn() -> TComplexScoreCombiner,
++    ) -> crate::Result<ScorerParts> {
+         let num_docs = reader.num_docs();
+         let mut per_occur_scorers = self.per_occur_scorers(reader, boost)?;
+ 
+@@ -234,7 +304,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
+         let must_special_scorer_counts = remove_and_count_all_and_empty_scorers(&mut must_scorers);
+ 
+         if must_special_scorer_counts.num_empty_scorers > 0 {
+-            return Ok(SpecializedScorer::Other(Box::new(EmptyScorer)));
++            return Ok(ScorerParts::empty());
+         }
+ 
+         let mut should_scorers = per_occur_scorers.remove(&Occur::Should).unwrap_or_default();
+@@ -249,7 +319,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
+ 
+         if exclude_special_scorer_counts.num_all_scorers > 0 {
+             // We exclude all documents at one point.
+-            return Ok(SpecializedScorer::Other(Box::new(EmptyScorer)));
++            return Ok(ScorerParts::empty());
+         }
+ 
+         let effective_minimum_number_should_match = self
+@@ -261,7 +331,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
+             if effective_minimum_number_should_match > num_of_should_scorers {
+                 // We don't have enough scorers to satisfy the minimum number of should matches.
+                 // The request will match no documents.
+-                return Ok(SpecializedScorer::Other(Box::new(EmptyScorer)));
++                return Ok(ScorerParts::empty());
+             }
+             match effective_minimum_number_should_match {
+                 0 if num_of_should_scorers == 0 => ShouldScorersCombinationMethod::Ignored,
+@@ -368,23 +438,10 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
+                 }
+             }
+         };
+-        if exclude_scorers.is_empty() {
+-            return Ok(include_scorer);
+-        }
+-
+-        let include_scorer_boxed = into_box_scorer(include_scorer, &score_combiner_fn, num_docs);
+-        let scorer: Box<dyn Scorer> = if exclude_scorers.len() == 1 {
+-            let exclude_scorer = exclude_scorers.pop().unwrap();
+-            match exclude_scorer.downcast::<TermScorer>() {
+-                // Cast to TermScorer succeeded
+-                Ok(exclude_scorer) => Box::new(Exclude::new(include_scorer_boxed, *exclude_scorer)),
+-                // We get back the original Box<dyn Scorer>
+-                Err(exclude_scorer) => Box::new(Exclude::new(include_scorer_boxed, exclude_scorer)),
+-            }
+-        } else {
+-            Box::new(Exclude::new(include_scorer_boxed, exclude_scorers))
+-        };
+-        Ok(SpecializedScorer::Other(scorer))
++        Ok(ScorerParts {
++            include: include_scorer,
++            exclude: exclude_scorers,
++        })
+     }
+ }
+ 
+@@ -513,13 +570,24 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
+     ///
+     /// More importantly, it makes it possible for scorers to implement
+     /// important optimization (e.g. BlockWAND for union).
++    ///
++    /// A term or term-union include with `MustNot` clauses is walked with BlockWAND too,
++    /// and the exclusion is applied only to the documents that beat the threshold.
+     fn for_each_pruning(
+         &self,
+         threshold: Score,
+         reader: &SegmentReader,
+         callback: &mut dyn FnMut(DocId, Score) -> Score,
+     ) -> crate::Result<()> {
+-        let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
++        let parts = self.complex_scorer_parts(reader, 1.0, &self.score_combiner_fn)?;
++        let parts = match parts.into_excluding_pruner() {
++            Ok((include, exclusion)) => {
++                for_each_pruning_excluding(include, exclusion, threshold, callback);
++                return Ok(());
++            }
++            Err(parts) => parts,
++        };
++        let scorer = parts.into_specialized_scorer(&self.score_combiner_fn, reader.num_docs());
+         match scorer {
+             SpecializedScorer::TermUnion(term_scorers) => {
+                 super::block_wand(term_scorers, threshold, callback);
+@@ -538,3 +606,86 @@ fn is_include_occur(occur: Occur) -> bool {
+         Occur::MustNot => false,
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::query::{EnableScoring, Query, SumCombiner, TermQuery};
++    use crate::schema::{IndexRecordOption, Schema, TEXT};
++    use crate::{Index, IndexWriter, Term};
++
++    fn takes_excluding_pruner(clauses: &[(Occur, &str)]) -> crate::Result<bool> {
++        let mut schema_builder = Schema::builder();
++        let text = schema_builder.add_text_field("text", TEXT);
++        let index = Index::create_in_ram(schema_builder.build());
++        let mut writer: IndexWriter = index.writer_for_tests()?;
++        writer.add_document(doc!(text => "a b c"))?;
++        writer.add_document(doc!(text => "a c"))?;
++        writer.commit()?;
++        let searcher = index.reader()?.searcher();
++        let scoring = EnableScoring::enabled_from_searcher(&searcher);
++        let weights = clauses
++            .iter()
++            .map(|&(occur, word)| {
++                let term = Term::from_field_text(text, word);
++                let query = TermQuery::new(term, IndexRecordOption::WithFreqs);
++                Ok((occur, query.weight(scoring)?))
++            })
++            .collect::<crate::Result<Vec<_>>>()?;
++        let weight = BooleanWeight::with_minimum_number_should_match(
++            weights,
++            0,
++            true,
++            Box::new(SumCombiner::default),
++        );
++        let parts =
++            weight.complex_scorer_parts(searcher.segment_reader(0), 1.0, SumCombiner::default)?;
++        Ok(parts.into_excluding_pruner().is_ok())
++    }
++
++    #[test]
++    fn test_term_include_with_exclusion_takes_excluding_pruner() -> crate::Result<()> {
++        assert!(takes_excluding_pruner(&[
++            (Occur::Should, "a"),
++            (Occur::MustNot, "b")
++        ])?);
++        assert!(takes_excluding_pruner(&[
++            (Occur::Must, "a"),
++            (Occur::MustNot, "b")
++        ])?);
++        assert!(takes_excluding_pruner(&[
++            (Occur::Must, "a"),
++            (Occur::MustNot, "b"),
++            (Occur::MustNot, "c")
++        ])?);
++        Ok(())
++    }
++
++    #[test]
++    fn test_term_union_with_exclusion_takes_excluding_pruner() -> crate::Result<()> {
++        assert!(takes_excluding_pruner(&[
++            (Occur::Should, "a"),
++            (Occur::Should, "b"),
++            (Occur::MustNot, "c")
++        ])?);
++        Ok(())
++    }
++
++    #[test]
++    fn test_other_shapes_keep_existing_path() -> crate::Result<()> {
++        assert!(!takes_excluding_pruner(&[
++            (Occur::Must, "a"),
++            (Occur::Must, "c"),
++            (Occur::MustNot, "b")
++        ])?);
++        assert!(!takes_excluding_pruner(&[
++            (Occur::Should, "a"),
++            (Occur::Should, "b")
++        ])?);
++        assert!(!takes_excluding_pruner(&[
++            (Occur::Must, "a"),
++            (Occur::Must, "b")
++        ])?);
++        Ok(())
++    }
++}
+diff --git a/src/query/boolean_query/excluding_pruner.rs b/src/query/boolean_query/excluding_pruner.rs
+new file mode 100644
+index 0000000..f20cbca
+--- /dev/null
++++ b/src/query/boolean_query/excluding_pruner.rs
+@@ -0,0 +1,334 @@
++use crate::query::boolean_query::{block_wand, block_wand_single_scorer};
++use crate::query::term_query::TermScorer;
++use crate::query::{Exclude, ExclusionSet, Scorer};
++use crate::{DocId, Score};
++
++/// The include part of a boolean query that block-max WAND can walk.
++pub(crate) enum PrunableInclude {
++    SingleTerm(Box<TermScorer>),
++    TermUnion(Vec<TermScorer>),
++}
++
++/// The `MustNot` scorers of a boolean query, keeping the concrete `TermScorer`
++/// type for a single term so that probing it avoids dynamic dispatch.
++pub(crate) enum ExclusionScorers {
++    Term(Box<TermScorer>),
++    Other(Box<dyn Scorer>),
++    Many(Vec<Box<dyn Scorer>>),
++}
++
++impl ExclusionScorers {
++    pub(crate) fn new(mut scorers: Vec<Box<dyn Scorer>>) -> ExclusionScorers {
++        if scorers.len() != 1 {
++            return ExclusionScorers::Many(scorers);
++        }
++        match scorers.pop().unwrap().downcast::<TermScorer>() {
++            Ok(term_scorer) => ExclusionScorers::Term(term_scorer),
++            Err(scorer) => ExclusionScorers::Other(scorer),
++        }
++    }
++
++    pub(crate) fn exclude_from(self, include: Box<dyn Scorer>) -> Box<dyn Scorer> {
++        match self {
++            ExclusionScorers::Term(scorer) => Box::new(Exclude::new(include, *scorer)),
++            ExclusionScorers::Other(scorer) => Box::new(Exclude::new(include, scorer)),
++            ExclusionScorers::Many(scorers) => Box::new(Exclude::new(include, scorers)),
++        }
++    }
++}
++
++impl ExclusionSet for ExclusionScorers {
++    #[inline]
++    fn contains(&mut self, doc: DocId) -> bool {
++        match self {
++            ExclusionScorers::Term(scorer) => ExclusionSet::contains(&mut **scorer, doc),
++            ExclusionScorers::Other(scorer) => ExclusionSet::contains(scorer, doc),
++            ExclusionScorers::Many(scorers) => ExclusionSet::contains(scorers, doc),
++        }
++    }
++}
++
++/// Runs block-max WAND over `include` and passes on to `callback` only the documents
++/// that are not in `exclusion`.
++///
++/// The exclusion set cannot change a score, so it is probed last: only for the documents
++/// that already beat the threshold. Both walkers emit strictly increasing doc ids, which is
++/// the contract `ExclusionSet::contains` relies on. This mirrors how deleted documents are
++/// filtered in the callback of `SortBySimilarityScore::collect_segment_top_k`.
++pub(crate) fn for_each_pruning_excluding(
++    include: PrunableInclude,
++    mut exclusion: impl ExclusionSet,
++    threshold: Score,
++    callback: &mut dyn FnMut(DocId, Score) -> Score,
++) {
++    let mut current_threshold = threshold;
++    let mut filtered_callback = |doc: DocId, score: Score| {
++        if exclusion.contains(doc) {
++            return current_threshold;
++        }
++        current_threshold = callback(doc, score);
++        current_threshold
++    };
++    match include {
++        PrunableInclude::SingleTerm(scorer) => {
++            block_wand_single_scorer(*scorer, threshold, &mut filtered_callback)
++        }
++        PrunableInclude::TermUnion(scorers) => {
++            block_wand(scorers, threshold, &mut filtered_callback)
++        }
++    }
++}
++
++#[cfg(test)]
++fn nearly_equals(left: Score, right: Score) -> bool {
++    (left - right).abs() <= 0.0001 * (left + right).abs()
++}
++
++/// Asserts that two top-k lists sorted by descending score are the same up to ties:
++/// equal hit counts, equal score lists, and the same documents apart from those tied
++/// with the k-th score when the list is full.
++#[cfg(test)]
++pub(crate) fn assert_same_top_k<D: Copy + Ord + std::fmt::Debug>(
++    pruned: &[(Score, D)],
++    naive: &[(Score, D)],
++    k: usize,
++    context: &str,
++) {
++    assert_eq!(pruned.len(), naive.len(), "{context}: hit counts differ");
++    for (&(pruned_score, _), &(naive_score, _)) in pruned.iter().zip(naive) {
++        assert!(
++            nearly_equals(pruned_score, naive_score),
++            "{context}: score lists differ\npruned {pruned:?}\nnaive {naive:?}"
++        );
++    }
++    let Some(&(kth_score, _)) = naive.last() else {
++        return;
++    };
++    let is_tie_at_kth = |score: Score| naive.len() == k && nearly_equals(score, kth_score);
++    let docs_beating_ties = |hits: &[(Score, D)]| {
++        let mut docs: Vec<D> = hits
++            .iter()
++            .filter(|(score, _)| !is_tie_at_kth(*score))
++            .map(|&(_, doc)| doc)
++            .collect();
++        docs.sort();
++        docs
++    };
++    assert_eq!(
++        docs_beating_ties(pruned),
++        docs_beating_ties(naive),
++        "{context}: documents differ beyond ties"
++    );
++}
++
++#[cfg(test)]
++mod tests {
++    use std::collections::HashSet;
++
++    use rand::rngs::StdRng;
++    use rand::{Rng, SeedableRng};
++
++    use super::assert_same_top_k;
++    use crate::collector::{Count, TopDocs};
++    use crate::indexer::NoMergePolicy;
++    use crate::query::{BooleanQuery, EnableScoring, Occur, Query, TermQuery};
++    use crate::schema::{Field, IndexRecordOption, Schema, INDEXED, TEXT};
++    use crate::{DocAddress, Index, IndexWriter, Score, Searcher, Term};
++
++    const NUM_SEGMENTS: u64 = 3;
++    const DOCS_PER_SEGMENT: u64 = 3_000;
++    const TOP_KS: [usize; 4] = [1, 5, 10, 1000];
++    const MIN_MATCHES: usize = 4 * 128;
++
++    struct TestIndex {
++        index: Index,
++        text: Field,
++        alive_docs: Vec<HashSet<&'static str>>,
++    }
++
++    struct Case {
++        clauses: &'static [(Occur, &'static str)],
++        matches: fn(&HashSet<&'static str>) -> bool,
++    }
++
++    fn cases() -> Vec<Case> {
++        vec![
++            Case {
++                clauses: &[(Occur::Should, "a"), (Occur::MustNot, "b")],
++                matches: |words| words.contains("a") && !words.contains("b"),
++            },
++            Case {
++                clauses: &[(Occur::Must, "a"), (Occur::MustNot, "b")],
++                matches: |words| words.contains("a") && !words.contains("b"),
++            },
++            Case {
++                clauses: &[
++                    (Occur::Should, "a"),
++                    (Occur::Should, "b"),
++                    (Occur::MustNot, "c"),
++                ],
++                matches: |words| {
++                    (words.contains("a") || words.contains("b")) && !words.contains("c")
++                },
++            },
++            Case {
++                clauses: &[
++                    (Occur::Must, "a"),
++                    (Occur::MustNot, "b"),
++                    (Occur::MustNot, "c"),
++                ],
++                matches: |words| {
++                    words.contains("a") && !words.contains("b") && !words.contains("c")
++                },
++            },
++            Case {
++                clauses: &[
++                    (Occur::Must, "a"),
++                    (Occur::Must, "c"),
++                    (Occur::MustNot, "b"),
++                ],
++                matches: |words| words.contains("a") && words.contains("c") && !words.contains("b"),
++            },
++        ]
++    }
++
++    fn random_term_freq(rng: &mut StdRng, probability: f64) -> usize {
++        if rng.random_bool(probability) {
++            rng.random_range(1..=4)
++        } else {
++            0
++        }
++    }
++
++    /// `b` is likelier in documents with a high `a` frequency, so excluding `b` removes
++    /// many of the best `a` documents: an excluded document must never raise the threshold.
++    fn random_doc_words(rng: &mut StdRng) -> Vec<&'static str> {
++        let a_freq = random_term_freq(rng, 0.6);
++        let b_probability = if a_freq >= 3 { 0.8 } else { 0.3 };
++        let b_freq = random_term_freq(rng, b_probability);
++        let c_freq = random_term_freq(rng, 0.3);
++        let filler_len = rng.random_range(0..30);
++        [
++            ("a", a_freq),
++            ("b", b_freq),
++            ("c", c_freq),
++            ("x", filler_len),
++        ]
++        .into_iter()
++        .flat_map(|(word, freq)| std::iter::repeat_n(word, freq))
++        .collect()
++    }
++
++    fn is_deleted(doc_id: u64, delete_every: Option<u64>) -> bool {
++        delete_every.is_some_and(|every| doc_id % every == 0)
++    }
++
++    fn build_index(delete_every: Option<u64>) -> crate::Result<TestIndex> {
++        let mut schema_builder = Schema::builder();
++        let text = schema_builder.add_text_field("text", TEXT);
++        let id = schema_builder.add_u64_field("id", INDEXED);
++        let index = Index::create_in_ram(schema_builder.build());
++        let mut writer: IndexWriter = index.writer_for_tests()?;
++        writer.set_merge_policy(Box::new(NoMergePolicy));
++        let mut rng = StdRng::seed_from_u64(42);
++        let mut alive_docs = Vec::new();
++        for doc_id in 0..NUM_SEGMENTS * DOCS_PER_SEGMENT {
++            let words = random_doc_words(&mut rng);
++            writer.add_document(doc!(text => words.join(" "), id => doc_id))?;
++            if !is_deleted(doc_id, delete_every) {
++                alive_docs.push(words.into_iter().collect());
++            }
++            if (doc_id + 1) % DOCS_PER_SEGMENT == 0 {
++                writer.commit()?;
++            }
++        }
++        for doc_id in 0..NUM_SEGMENTS * DOCS_PER_SEGMENT {
++            if is_deleted(doc_id, delete_every) {
++                writer.delete_term(Term::from_field_u64(id, doc_id));
++            }
++        }
++        writer.commit()?;
++        Ok(TestIndex {
++            index,
++            text,
++            alive_docs,
++        })
++    }
++
++    fn boolean_query(text: Field, clauses: &[(Occur, &str)]) -> BooleanQuery {
++        BooleanQuery::new(
++            clauses
++                .iter()
++                .map(|&(occur, word)| {
++                    let term = Term::from_field_text(text, word);
++                    let query: Box<dyn Query> =
++                        Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
++                    (occur, query)
++                })
++                .collect(),
++        )
++    }
++
++    fn all_alive_scored_docs(
++        searcher: &Searcher,
++        query: &dyn Query,
++    ) -> crate::Result<Vec<(Score, DocAddress)>> {
++        let weight = query.weight(EnableScoring::enabled_from_searcher(searcher))?;
++        let mut hits = Vec::new();
++        for (segment_ord, reader) in searcher.segment_readers().iter().enumerate() {
++            weight.for_each(reader, &mut |doc, score| {
++                if !reader.is_deleted(doc) {
++                    hits.push((score, DocAddress::new(segment_ord as u32, doc)));
++                }
++            })?;
++        }
++        Ok(hits)
++    }
++
++    fn naive_top_k(mut hits: Vec<(Score, DocAddress)>, k: usize) -> Vec<(Score, DocAddress)> {
++        hits.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
++        hits.truncate(k);
++        hits
++    }
++
++    fn check_pruned_top_k_matches_full_walk(delete_every: Option<u64>) -> crate::Result<()> {
++        let test_index = build_index(delete_every)?;
++        let searcher = test_index.index.reader()?.searcher();
++        assert_eq!(searcher.segment_readers().len() as u64, NUM_SEGMENTS);
++        let has_deletes = searcher.segment_readers().iter().all(|r| r.has_deletes());
++        assert_eq!(has_deletes, delete_every.is_some());
++        for case in cases() {
++            let query = boolean_query(test_index.text, case.clauses);
++            let all_hits = all_alive_scored_docs(&searcher, &query)?;
++            let expected_count = test_index
++                .alive_docs
++                .iter()
++                .filter(|words| (case.matches)(words))
++                .count();
++            assert!(
++                expected_count >= MIN_MATCHES,
++                "{:?} {expected_count}",
++                case.clauses
++            );
++            assert_eq!(all_hits.len(), expected_count, "{:?}", case.clauses);
++            assert_eq!(searcher.search(&query, &Count)?, expected_count);
++            for k in TOP_KS {
++                let pruned = searcher.search(&query, &TopDocs::with_limit(k).order_by_score())?;
++                let naive = naive_top_k(all_hits.clone(), k);
++                let context = format!("{:?} k={k}", case.clauses);
++                assert_same_top_k(&pruned, &naive, k, &context);
++            }
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn test_excluding_pruning_matches_full_walk() -> crate::Result<()> {
++        check_pruned_top_k_matches_full_walk(None)
++    }
++
++    #[test]
++    fn test_excluding_pruning_matches_full_walk_with_deleted_docs() -> crate::Result<()> {
++        check_pruned_top_k_matches_full_walk(Some(7))
++    }
++}
+diff --git a/src/query/boolean_query/mod.rs b/src/query/boolean_query/mod.rs
+index 681881c..f2adc0d 100644
+--- a/src/query/boolean_query/mod.rs
++++ b/src/query/boolean_query/mod.rs
+@@ -1,10 +1,14 @@
+ mod block_wand;
+ mod boolean_query;
+ mod boolean_weight;
++mod excluding_pruner;
+ 
+ pub(crate) use self::block_wand::{block_wand, block_wand_single_scorer};
+ pub use self::boolean_query::BooleanQuery;
+ pub use self::boolean_weight::BooleanWeight;
++pub(crate) use self::excluding_pruner::{
++    for_each_pruning_excluding, ExclusionScorers, PrunableInclude,
++};
+ 
+ #[cfg(test)]
+ mod tests {
