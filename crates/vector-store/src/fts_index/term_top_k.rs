@@ -14,6 +14,8 @@
 //! The hits and their scores are the ones `TopDocs::with_limit(k).order_by_score()`
 //! returns for the `TermQuery`, down to ties and to the documents its block-max pruning
 //! may skip: the per-segment pruning and both top-k stages follow tantivy's rules.
+//! Each segment runs tantivy's own `block_wand_single_scorer`, which moves past a block
+//! whose maximum score cannot beat the threshold without decoding it.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -29,9 +31,10 @@ use tantivy::Term;
 use tantivy::collector::TopNComputer;
 use tantivy::collector::sort_key::NaturalComparator;
 use tantivy::fieldnorm::FieldNormReader;
-use tantivy::postings::BlockSegmentPostings;
 use tantivy::postings::TermInfo;
 use tantivy::query::Bm25Weight;
+use tantivy::query::TermScorer;
+use tantivy::query::block_wand_single_scorer;
 use tantivy::schema::IndexRecordOption;
 
 /// Whether `field` of `searcher`'s schema records term frequencies, which BM25 scores
@@ -132,25 +135,37 @@ impl<'a> TermLookup<'a> {
 }
 
 /// The segment's best hits, unordered, as tantivy's block-max WAND over a single term
-/// collects them.
+/// collects them, with the deleted-document filter of `TopDocs`' pruning callback.
 fn segment_top_k(
     segment: &SegmentTerm,
     term: &Term,
     bm25: &Bm25Weight,
     limit: usize,
 ) -> tantivy::Result<Vec<(Score, DocId)>> {
-    let fieldnorms = fieldnorm_reader(segment.reader, term)?;
-    let mut postings = segment
-        .inverted_index
-        .read_block_postings_from_terminfo(&segment.term_info, IndexRecordOption::WithFreqs)?;
+    let scorer = term_scorer(segment, term, bm25)?;
+    let alive = segment.reader.alive_bitset();
     let mut top_k = SegmentTopK::new(limit);
-    while postings.block_len() > 0 {
-        if top_k.may_improve(&mut postings, &fieldnorms, bm25) {
-            collect_block(&postings, &fieldnorms, bm25, segment.reader, &mut top_k);
+    block_wand_single_scorer(scorer, Score::MIN, &mut |doc, score| {
+        if alive.is_none_or(|alive| alive.is_alive(doc)) {
+            top_k.push(score, doc);
         }
-        postings.advance();
-    }
+        top_k.threshold()
+    });
     Ok(top_k.into_vec())
+}
+
+/// The scorer `TermWeight` builds for the term, over the postings of the segment's
+/// single term lookup.
+fn term_scorer(
+    segment: &SegmentTerm,
+    term: &Term,
+    bm25: &Bm25Weight,
+) -> tantivy::Result<TermScorer> {
+    let fieldnorms = fieldnorm_reader(segment.reader, term)?;
+    let postings = segment
+        .inverted_index
+        .read_postings_from_terminfo(&segment.term_info, IndexRecordOption::WithFreqs)?;
+    Ok(TermScorer::new(postings, fieldnorms, bm25.clone()))
 }
 
 /// The field norms `TermWeight` scores with: the segment's, or a constant 1 when the
@@ -160,22 +175,6 @@ fn fieldnorm_reader(reader: &SegmentReader, term: &Term) -> tantivy::Result<Fiel
         .fieldnorms_readers()
         .get_field(term.field())?
         .unwrap_or_else(|| FieldNormReader::constant(reader.max_doc(), 1)))
-}
-
-fn collect_block(
-    postings: &BlockSegmentPostings,
-    fieldnorms: &FieldNormReader,
-    bm25: &Bm25Weight,
-    reader: &SegmentReader,
-    top_k: &mut SegmentTopK,
-) {
-    let alive = reader.alive_bitset();
-    for (&doc, &term_freq) in postings.docs().iter().zip(postings.freqs()) {
-        let score = bm25.score(fieldnorms.fieldnorm_id(doc), term_freq);
-        if score > top_k.threshold() && alive.is_none_or(|alive| alive.is_alive(doc)) {
-            top_k.push(score, doc);
-        }
-    }
 }
 
 /// Tantivy's `TopNComputer` for one segment, down to the threshold it exposes to the
@@ -203,17 +202,6 @@ impl SegmentTopK {
 
     fn threshold(&self) -> Score {
         self.threshold.unwrap_or(Score::MIN)
-    }
-
-    /// Whether the current block can hold a hit that beats the threshold; the block-max
-    /// check of `block_wand_single_scorer`.
-    fn may_improve(
-        &self,
-        postings: &mut BlockSegmentPostings,
-        fieldnorms: &FieldNormReader,
-        bm25: &Bm25Weight,
-    ) -> bool {
-        self.threshold.is_none() || postings.block_max_score(fieldnorms, bm25) >= self.threshold()
     }
 
     fn push(&mut self, score: Score, doc: DocId) {
