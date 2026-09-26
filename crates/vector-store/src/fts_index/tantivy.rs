@@ -754,20 +754,24 @@ fn handle_search(
     let table = table.read().unwrap();
     let partition_id = find_partition_id(table.deref(), index_key)?;
 
-    let mut primary_ids = HitPrimaryIds::new(&searcher, &state.primary_ids);
-    let (primary_keys, scores) = top_docs
-        .into_iter()
-        .map(|(score, doc_address)| Ok((score, primary_ids.primary_id(doc_address)?)))
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .into_iter()
-        .filter_map(|(score, primary_id)| {
-            table
-                .primary_key(partition_id, primary_id)
-                .map(|pk| (pk, score))
-        })
-        .unzip();
+    let mut hit_primary_ids = HitPrimaryIds::new(&searcher, &state.primary_ids);
+    let primary_ids = top_docs
+        .iter()
+        .map(|&(_, doc_address)| hit_primary_ids.primary_id(doc_address))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut found = (
+        Vec::with_capacity(top_docs.len()),
+        Vec::with_capacity(top_docs.len()),
+    );
+    found.extend(
+        table
+            .primary_keys(partition_id, &primary_ids)
+            .into_iter()
+            .zip(top_docs)
+            .filter_map(|(primary_key, (score, _))| primary_key.map(|pk| (pk, score))),
+    );
 
-    Ok((primary_keys, scores))
+    Ok(found)
 }
 
 fn top_docs(
@@ -1122,10 +1126,15 @@ mod tests {
             .returning(move |_index_key| Some(index_id));
         mock.expect_partition_id()
             .returning(move |_index_key, _restrictions| Some((partition_id, None)));
-        mock.expect_primary_key()
-            .returning(|_partition_id, primary_id| {
-                let id_val = u64::from(primary_id);
-                Some(PrimaryKey::from(vec![CqlValue::BigInt(id_val as i64)]))
+        mock.expect_primary_keys()
+            .returning(|_partition_id, primary_ids| {
+                primary_ids
+                    .iter()
+                    .map(|&primary_id| {
+                        let id_val = u64::from(primary_id);
+                        Some(PrimaryKey::from(vec![CqlValue::BigInt(id_val as i64)]))
+                    })
+                    .collect()
             });
         Arc::new(RwLock::new(mock))
     }

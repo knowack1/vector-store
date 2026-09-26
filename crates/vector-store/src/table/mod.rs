@@ -585,6 +585,17 @@ impl Table {
         Ok(())
     }
 
+    fn valid_primary_key(
+        &self,
+        partition_id: PartitionId,
+        primary_id: PrimaryId,
+    ) -> Option<&PrimaryKey> {
+        if !self.is_valid_primary_id(partition_id, primary_id) {
+            return None;
+        }
+        self.primary_keys.get(primary_id)?.as_ref()
+    }
+
     fn is_valid_primary_id(&self, partition_id: PartitionId, primary_id: PrimaryId) -> bool {
         self.indexes
             .get(&partition_id.index_id())
@@ -1128,6 +1139,13 @@ pub(crate) trait TableSearch {
 
     fn primary_key(&self, partition_id: PartitionId, primary_id: PrimaryId) -> Option<PrimaryKey>;
 
+    /// [`primary_key`](Self::primary_key) of each of `primary_ids`, in order.
+    fn primary_keys(
+        &self,
+        partition_id: PartitionId,
+        primary_ids: &[PrimaryId],
+    ) -> Vec<Option<PrimaryKey>>;
+
     fn is_valid_for(
         &self,
         partition_id: PartitionId,
@@ -1170,10 +1188,26 @@ impl TableSearch for Table {
 
     #[hotpath::measure]
     fn primary_key(&self, partition_id: PartitionId, primary_id: PrimaryId) -> Option<PrimaryKey> {
-        if !self.is_valid_primary_id(partition_id, primary_id) {
-            return None;
-        }
-        self.primary_keys.get(primary_id).cloned().flatten()
+        self.valid_primary_key(partition_id, primary_id).cloned()
+    }
+
+    /// Looks every id up before cloning any key. A clone is an atomic increment, which
+    /// waits for every load before it, so a lookup and clone per id would take each id's
+    /// cache misses one after another instead of overlapping them.
+    #[hotpath::measure]
+    fn primary_keys(
+        &self,
+        partition_id: PartitionId,
+        primary_ids: &[PrimaryId],
+    ) -> Vec<Option<PrimaryKey>> {
+        let found: Vec<Option<&PrimaryKey>> = primary_ids
+            .iter()
+            .map(|&primary_id| self.valid_primary_key(partition_id, primary_id))
+            .collect();
+        found
+            .into_iter()
+            .map(Option::<&PrimaryKey>::cloned)
+            .collect()
     }
 
     #[hotpath::measure]
@@ -1781,6 +1815,26 @@ mod tests {
             );
             primary_id_prev = primary_id4;
         }
+
+        let primary_ids = [
+            primary_id1,
+            primary_id2,
+            primary_id_prev,
+            primary_id3,
+            primary_id1,
+        ];
+        assert_eq!(
+            table.primary_keys(partition_id1, &primary_ids),
+            [Some(pk1.clone()), None, Some(pk2), None, Some(pk1)]
+        );
+        assert_eq!(
+            table.primary_keys(partition_id1, &primary_ids),
+            primary_ids
+                .iter()
+                .map(|&primary_id| table.primary_key(partition_id1, primary_id))
+                .collect::<Vec<_>>()
+        );
+        assert!(table.primary_keys(partition_id1, &[]).is_empty());
     }
 
     #[test]
