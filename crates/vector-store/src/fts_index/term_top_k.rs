@@ -266,6 +266,13 @@ mod tests {
     const BLOCK: usize = 128;
     const STRONG_EVERY: usize = 1000;
     const PRUNABLE_WORDS: [&str; 2] = ["common", "filler"];
+    /// Limits at and above the ones `LIMITS` covers, up to more than any list's length.
+    const LARGE_LIMITS: [usize; 5] = [100, 500, 1000, 2000, 100_000];
+    /// Long lists, each ending in a partial, an empty or a one-document block.
+    const LONG_PRUNABLE_SEGMENTS: [usize; 3] = [200 * BLOCK + 37, 120 * BLOCK, 64 * BLOCK + 1];
+    /// A strong prefix longer than 1000 live documents, so that a limit of 100-1000 prunes
+    /// the weak blocks after it and still collects the blocks holding a strong document.
+    const LONG_STRONG_PREFIX: usize = 12 * BLOCK;
 
     /// Deterministic xorshift, so a failure reproduces.
     struct Rng(u64);
@@ -356,15 +363,15 @@ mod tests {
     }
 
     /// The body of document `position` of a posting list of `common` whose blocks the
-    /// block-max check mostly prunes: its first block and every `STRONG_EVERY`-th
-    /// document repeat `common` in a short body, the others mention it once in a long
-    /// one, and its last document scores highest of all.
-    fn prunable_body(position: usize, docs: usize) -> String {
+    /// block-max check mostly prunes: its first `strong_prefix` documents and every
+    /// `STRONG_EVERY`-th document repeat `common` in a short body, the others mention it
+    /// once in a long one, and its last document scores highest of all.
+    fn prunable_body(position: usize, docs: usize, strong_prefix: usize) -> String {
         let (repeats, fillers) = if position + 1 == docs {
             (5, 0)
         } else if position % STRONG_EVERY == 0 {
             (3, 1)
-        } else if position < BLOCK {
+        } else if position < strong_prefix {
             (2, 2)
         } else {
             (1, 20 + position % 7)
@@ -374,9 +381,17 @@ mod tests {
         words.collect::<Vec<_>>().join(" ")
     }
 
-    /// Commits one segment of `prunable_body` documents per entry of `sizes`, and
-    /// returns the id of each segment's last, best document.
+    /// Commits one segment of `prunable_body` documents with a strong first block per
+    /// entry of `sizes`, and returns the id of each segment's last, best document.
     fn add_prunable_segments(corpus: &Corpus, sizes: &[usize]) -> Vec<u64> {
+        add_prunable_segments_with_prefix(corpus, sizes, BLOCK)
+    }
+
+    fn add_prunable_segments_with_prefix(
+        corpus: &Corpus,
+        sizes: &[usize],
+        strong_prefix: usize,
+    ) -> Vec<u64> {
         let mut writer = corpus.writer();
         let mut next_id = 0;
         let mut best_ids = Vec::new();
@@ -384,7 +399,7 @@ mod tests {
             for position in 0..docs {
                 let mut doc = TantivyDocument::new();
                 doc.add_u64(corpus.id, next_id);
-                doc.add_text(corpus.body, prunable_body(position, docs));
+                doc.add_text(corpus.body, prunable_body(position, docs, strong_prefix));
                 writer.add_document(doc).unwrap();
                 next_id += 1;
             }
@@ -432,10 +447,18 @@ mod tests {
     }
 
     fn assert_same_as_tantivy_for(corpus: &Corpus, words: impl IntoIterator<Item = String>) {
+        assert_same_as_tantivy_at(corpus, words, &LIMITS);
+    }
+
+    fn assert_same_as_tantivy_at(
+        corpus: &Corpus,
+        words: impl IntoIterator<Item = String>,
+        limits: &[usize],
+    ) {
         let searcher = corpus.searcher();
         for word in words {
             let term = corpus.term(&word);
-            for limit in LIMITS {
+            for &limit in limits {
                 assert_eq!(
                     search(&searcher, &term, limit).unwrap(),
                     tantivy_top_k(&searcher, &term, limit),
@@ -526,6 +549,37 @@ mod tests {
                 .all(|reader| reader.alive_bitset().is_some())
         );
         assert_same_as_tantivy_for(&corpus, prunable_words());
+    }
+
+    #[test]
+    fn matches_tantivy_at_large_limits_on_long_prunable_lists() {
+        let corpus = Corpus::new();
+        add_prunable_segments_with_prefix(&corpus, &LONG_PRUNABLE_SEGMENTS, LONG_STRONG_PREFIX);
+        assert_same_as_tantivy_at(&corpus, prunable_words(), &LARGE_LIMITS);
+    }
+
+    #[test]
+    fn matches_tantivy_at_large_limits_with_deleted_documents() {
+        let corpus = Corpus::new();
+        let best_ids =
+            add_prunable_segments_with_prefix(&corpus, &LONG_PRUNABLE_SEGMENTS, LONG_STRONG_PREFIX);
+        let docs = LONG_PRUNABLE_SEGMENTS.iter().sum::<usize>() as u64;
+        delete_every(&corpus, 3, docs);
+        delete_ids(&corpus, best_ids[1..].iter().copied());
+        assert_same_as_tantivy_at(&corpus, prunable_words(), &LARGE_LIMITS);
+    }
+
+    #[test]
+    fn returns_every_live_hit_when_the_limit_exceeds_the_doc_freq() {
+        let corpus = Corpus::new();
+        let sizes = [5 * BLOCK + 3, 2 * BLOCK];
+        add_prunable_segments(&corpus, &sizes);
+        let docs = sizes.iter().sum::<usize>() as u64;
+        delete_every(&corpus, 4, docs);
+        let hits = search(&corpus.searcher(), &corpus.term("common"), 10 * BLOCK).unwrap();
+        let live = docs - docs.div_ceil(4);
+        assert_eq!(hits.len() as u64, live);
+        assert_same_as_tantivy_at(&corpus, prunable_words(), &[live as usize, 10 * BLOCK]);
     }
 
     #[test]
