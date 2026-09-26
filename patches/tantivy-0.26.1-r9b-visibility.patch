@@ -1,0 +1,37 @@
+# Make tantivy's single-term block-max WAND callable from outside the crate
+# Base: tantivy 0.26.1 (crates.io) plus tantivy-0.26.1-phrase-pruning.patch
+# Exports query::block_wand_single_scorer (was pub(crate)) and query::TermScorer (a pub
+# type that no public path reached); no behaviour change.
+# Apply after the phrase patch with: git apply -p1 tantivy-0.26.1-r9b-visibility.patch
+--- a/src/query/boolean_query/mod.rs
++++ b/src/query/boolean_query/mod.rs
+@@ -2,7 +2,8 @@
+ mod boolean_query;
+ mod boolean_weight;
+ 
+-pub(crate) use self::block_wand::{block_wand, block_wand_single_scorer};
++pub(crate) use self::block_wand::block_wand;
++pub use self::block_wand::block_wand_single_scorer;
+ pub use self::boolean_query::BooleanQuery;
+ pub use self::boolean_weight::BooleanWeight;
+ 
+--- a/src/query/mod.rs
++++ b/src/query/mod.rs
+@@ -38,7 +38,7 @@
+ pub use self::automaton_weight::AutomatonWeight;
+ pub use self::bitset::BitSetDocSet;
+ pub use self::bm25::{Bm25StatisticsProvider, Bm25Weight};
+-pub use self::boolean_query::{BooleanQuery, BooleanWeight};
++pub use self::boolean_query::{block_wand_single_scorer, BooleanQuery, BooleanWeight};
+ pub use self::boost_query::{BoostQuery, BoostWeight};
+ pub use self::const_score_query::{ConstScoreQuery, ConstScorer};
+ pub use self::disjunction_max_query::DisjunctionMaxQuery;
+@@ -62,7 +62,7 @@
+ pub use self::score_combiner::{DisjunctionMaxCombiner, ScoreCombiner, SumCombiner};
+ pub use self::scorer::Scorer;
+ pub use self::set_query::TermSetQuery;
+-pub use self::term_query::TermQuery;
++pub use self::term_query::{TermQuery, TermScorer};
+ pub use self::union::BufferedUnionScorer;
+ #[cfg(test)]
+ pub use self::vec_docset::VecDocSet;
