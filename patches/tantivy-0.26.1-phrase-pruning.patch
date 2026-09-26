@@ -1,0 +1,130 @@
+# Phrase-query top-K pruning for Tantivy 0.26.1
+# Base: tantivy 0.26.1 (crates.io, unmodified)
+# Addresses quickwit-oss/tantivy#2518 'Phrase Query Top N Pruning'
+# Apply with: git apply -p1 tantivy-phrase-pruning.patch
+
+--- a/src/query/phrase_query/phrase_scorer.rs
++++ b/src/query/phrase_query/phrase_scorer.rs
+@@ -23,6 +23,12 @@
+     pub fn positions(&mut self, output: &mut Vec<u32>) {
+         self.postings.positions_with_offset(self.offset, output)
+     }
++
++    /// The term frequency of the current document. Available straight from the
++    /// doc/freq postings, without touching the position list.
++    pub fn term_freq(&self) -> u32 {
++        self.postings.term_freq()
++    }
+ }
+ 
+ impl<TPostings: Postings> DocSet for PostingsWithOffset<TPostings> {
+@@ -411,6 +417,81 @@
+         &self.left_positions
+     }
+ 
++    /// An upper bound on the current document's phrase score, computed without
++    /// decoding a single position list.
++    ///
++    /// Every phrase occurrence needs one occurrence of each of its terms, so
++    /// `phrase_freq <= min_i term_freq_i`. BM25 is monotonically increasing in
++    /// frequency, so scoring that minimum can only overestimate. Term
++    /// frequencies come from the doc/freq postings, which are already decoded
++    /// by the intersection — the position lists, which are what phrase
++    /// matching is actually expensive for, are never touched.
++    fn phrase_score_upper_bound(&mut self) -> Score {
++        if self.similarity_weight_opt.is_none() {
++            return 1.0;
++        }
++        let doc = self.intersection_docset.doc();
++        let mut min_term_freq = u32::MAX;
++        for ord in 0..self.num_terms {
++            let term_freq = self
++                .intersection_docset
++                .docset_mut_specialized(ord)
++                .term_freq();
++            min_term_freq = min_term_freq.min(term_freq);
++        }
++        let fieldnorm_id = self.fieldnorm_reader.fieldnorm_id(doc);
++        self.similarity_weight_opt
++            .as_ref()
++            .map(|similarity_weight| similarity_weight.score(fieldnorm_id, min_term_freq))
++            .unwrap_or(1.0)
++    }
++
++    /// [`DocSet::advance`], skipping the position intersection for any document
++    /// that provably cannot score above `threshold`.
++    fn advance_pruning(&mut self, threshold: Score) -> DocId {
++        loop {
++            let doc = self.intersection_docset.advance();
++            if doc == TERMINATED {
++                return TERMINATED;
++            }
++            if self.phrase_score_upper_bound() <= threshold {
++                continue;
++            }
++            if self.phrase_match() {
++                return doc;
++            }
++        }
++    }
++
++    /// Block-max style pruning walk over the phrase matches.
++    ///
++    /// Two shortcuts the default [`Weight::for_each_pruning`] fallback cannot
++    /// take: it stops outright once the heap threshold exceeds what this
++    /// weight could ever score, and it skips the position work for documents
++    /// bounded out by [`Self::phrase_score_upper_bound`].
++    pub(crate) fn for_each_pruning_phrase(
++        &mut self,
++        mut threshold: Score,
++        callback: &mut dyn FnMut(DocId, Score) -> Score,
++    ) {
++        let global_max_score = self
++            .similarity_weight_opt
++            .as_ref()
++            .map(|similarity_weight| similarity_weight.max_score())
++            .unwrap_or(Score::INFINITY);
++        let mut doc = self.doc();
++        while doc != TERMINATED {
++            if threshold >= global_max_score {
++                return;
++            }
++            let score = self.score();
++            if score > threshold {
++                threshold = callback(doc, score);
++            }
++            doc = self.advance_pruning(threshold);
++        }
++    }
++
+     fn phrase_match(&mut self) -> bool {
+         if self.similarity_weight_opt.is_some() {
+             let count = self.compute_phrase_count();
+--- a/src/query/phrase_query/phrase_weight.rs
++++ b/src/query/phrase_query/phrase_weight.rs
+@@ -82,6 +82,25 @@
+         }
+     }
+ 
++    /// Phrase queries fell through to the default implementation, which walks
++    /// and fully scores every matching document — so a phrase query cost
++    /// `O(total matches)` no matter how small the requested top-K was, while
++    /// term and boolean queries pruned. On a corpus with a large block of
++    /// near-duplicate text that is the difference between a few thousand
++    /// documents and a few hundred thousand.
++    fn for_each_pruning(
++        &self,
++        threshold: Score,
++        reader: &SegmentReader,
++        callback: &mut dyn FnMut(DocId, Score) -> Score,
++    ) -> crate::Result<()> {
++        let Some(mut scorer) = self.phrase_scorer(reader, 1.0)? else {
++            return Ok(());
++        };
++        scorer.for_each_pruning_phrase(threshold, callback);
++        Ok(())
++    }
++
+     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
+         let scorer_opt = self.phrase_scorer(reader, 1.0)?;
+         if scorer_opt.is_none() {
