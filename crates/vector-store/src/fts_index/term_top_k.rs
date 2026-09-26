@@ -263,6 +263,9 @@ mod tests {
 
     const VOCABULARY: usize = 12;
     const LIMITS: [usize; 7] = [1, 2, 3, 5, 10, 64, 1000];
+    const BLOCK: usize = 128;
+    const STRONG_EVERY: usize = 1000;
+    const PRUNABLE_WORDS: [&str; 2] = ["common", "filler"];
 
     /// Deterministic xorshift, so a failure reproduces.
     struct Rng(u64);
@@ -341,11 +344,80 @@ mod tests {
     }
 
     fn delete_every(corpus: &Corpus, step: u64, docs: u64) {
+        delete_ids(corpus, (0..docs).step_by(step as usize));
+    }
+
+    fn delete_ids(corpus: &Corpus, ids: impl IntoIterator<Item = u64>) {
         let mut writer = corpus.writer();
-        for id in (0..docs).step_by(step as usize) {
+        for id in ids {
             writer.delete_term(Term::from_field_u64(corpus.id, id));
         }
         writer.commit().unwrap();
+    }
+
+    /// The body of document `position` of a posting list of `common` whose blocks the
+    /// block-max check mostly prunes: its first block and every `STRONG_EVERY`-th
+    /// document repeat `common` in a short body, the others mention it once in a long
+    /// one, and its last document scores highest of all.
+    fn prunable_body(position: usize, docs: usize) -> String {
+        let (repeats, fillers) = if position + 1 == docs {
+            (5, 0)
+        } else if position % STRONG_EVERY == 0 {
+            (3, 1)
+        } else if position < BLOCK {
+            (2, 2)
+        } else {
+            (1, 20 + position % 7)
+        };
+        let words =
+            std::iter::repeat_n("common", repeats).chain(std::iter::repeat_n("filler", fillers));
+        words.collect::<Vec<_>>().join(" ")
+    }
+
+    /// Commits one segment of `prunable_body` documents per entry of `sizes`, and
+    /// returns the id of each segment's last, best document.
+    fn add_prunable_segments(corpus: &Corpus, sizes: &[usize]) -> Vec<u64> {
+        let mut writer = corpus.writer();
+        let mut next_id = 0;
+        let mut best_ids = Vec::new();
+        for &docs in sizes {
+            for position in 0..docs {
+                let mut doc = TantivyDocument::new();
+                doc.add_u64(corpus.id, next_id);
+                doc.add_text(corpus.body, prunable_body(position, docs));
+                writer.add_document(doc).unwrap();
+                next_id += 1;
+            }
+            best_ids.push(next_id - 1);
+            writer.commit().unwrap();
+        }
+        best_ids
+    }
+
+    fn segment_doc_freqs(corpus: &Corpus, word: &str) -> Vec<u32> {
+        let term = corpus.term(word);
+        corpus
+            .searcher()
+            .segment_readers()
+            .iter()
+            .map(|reader| {
+                let inverted_index = reader.inverted_index(corpus.body).unwrap();
+                inverted_index
+                    .get_term_info(&term)
+                    .unwrap()
+                    .map_or(0, |info| info.doc_freq)
+            })
+            .collect()
+    }
+
+    fn id_of(corpus: &Corpus, address: DocAddress) -> u64 {
+        let searcher = corpus.searcher();
+        let ids = searcher
+            .segment_reader(address.segment_ord)
+            .fast_fields()
+            .u64("id")
+            .unwrap();
+        ids.first(address.doc_id).unwrap()
     }
 
     fn tantivy_top_k(searcher: &Searcher, term: &Term, limit: usize) -> Vec<(Score, DocAddress)> {
@@ -356,8 +428,12 @@ mod tests {
     }
 
     fn assert_same_as_tantivy(corpus: &Corpus) {
+        assert_same_as_tantivy_for(corpus, (0..VOCABULARY).map(|rank| format!("w{rank}")));
+    }
+
+    fn assert_same_as_tantivy_for(corpus: &Corpus, words: impl IntoIterator<Item = String>) {
         let searcher = corpus.searcher();
-        for word in (0..VOCABULARY).map(|rank| format!("w{rank}")) {
+        for word in words {
             let term = corpus.term(&word);
             for limit in LIMITS {
                 assert_eq!(
@@ -395,6 +471,61 @@ mod tests {
                 .is_some()
         );
         assert_same_as_tantivy(&corpus);
+    }
+
+    fn prunable_words() -> impl Iterator<Item = String> {
+        PRUNABLE_WORDS.into_iter().map(String::from)
+    }
+
+    #[test]
+    fn matches_tantivy_when_most_blocks_are_pruned() {
+        let corpus = Corpus::new();
+        add_prunable_segments(&corpus, &[40 * BLOCK + 37]);
+        assert_same_as_tantivy_for(&corpus, prunable_words());
+    }
+
+    #[test]
+    fn finds_the_best_hit_in_a_partial_last_block() {
+        let corpus = Corpus::new();
+        let best_ids = add_prunable_segments(&corpus, &[40 * BLOCK + 37]);
+        assert_eq!(
+            segment_doc_freqs(&corpus, "common"),
+            [40 * BLOCK as u32 + 37]
+        );
+        let hits = search(&corpus.searcher(), &corpus.term("common"), 1).unwrap();
+        assert_eq!(id_of(&corpus, hits[0].1), best_ids[0]);
+    }
+
+    #[test]
+    fn matches_tantivy_when_most_blocks_are_pruned_across_segments() {
+        let corpus = Corpus::new();
+        add_prunable_segments(
+            &corpus,
+            &[30 * BLOCK + 5, 24 * BLOCK, 9 * BLOCK + 127, 3 * BLOCK],
+        );
+        let doc_freqs = segment_doc_freqs(&corpus, "common");
+        assert_eq!(doc_freqs.len(), 4);
+        assert!(doc_freqs.iter().any(|&df| df % BLOCK as u32 == 0));
+        assert!(doc_freqs.iter().any(|&df| df % BLOCK as u32 != 0));
+        assert_same_as_tantivy_for(&corpus, prunable_words());
+    }
+
+    #[test]
+    fn matches_tantivy_when_pruned_blocks_hold_deleted_documents() {
+        let corpus = Corpus::new();
+        let sizes = [20 * BLOCK + 77, 16 * BLOCK, 11 * BLOCK + 1];
+        let best_ids = add_prunable_segments(&corpus, &sizes);
+        let docs = sizes.iter().sum::<usize>() as u64;
+        delete_every(&corpus, 5, docs);
+        delete_ids(&corpus, best_ids[..2].iter().copied());
+        assert!(
+            corpus
+                .searcher()
+                .segment_readers()
+                .iter()
+                .all(|reader| reader.alive_bitset().is_some())
+        );
+        assert_same_as_tantivy_for(&corpus, prunable_words());
     }
 
     #[test]
