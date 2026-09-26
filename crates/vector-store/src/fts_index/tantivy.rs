@@ -70,6 +70,7 @@ use crate::Limit;
 use crate::Positions;
 use crate::fts_index::factory::FtsIndexConfiguration;
 use crate::fts_index::factory::FtsIndexFactory;
+use crate::fts_index::factory::FtsSearch;
 use crate::memory::Allocate;
 use crate::memory::Memory;
 use crate::memory::MemoryExt;
@@ -788,21 +789,27 @@ fn handle_stats(state: &IndexState) -> FtsStatsR {
     })
 }
 
+/// The index states of an actor, shared with its searcher.
+///
+/// Only the actor adds states. A state is created on the first write, so a searcher
+/// looks its state up on every search instead of keeping the one it first saw.
+type States = RwLock<BTreeMap<IndexId, Arc<IndexState>>>;
+
 fn get_or_create_state<T: TableSearch>(
-    states: &mut BTreeMap<IndexId, Arc<IndexState>>,
+    states: &States,
     table: &RwLock<T>,
     index: &FtsIndexConfiguration,
     tuning: FtsTuning,
 ) -> Option<Arc<IndexState>> {
     let key = &index.key;
     let index_id = table.read().unwrap().index_id(key)?;
-    if let Some(state) = states.get(&index_id) {
+    if let Some(state) = states.read().unwrap().get(&index_id) {
         return Some(Arc::clone(state));
     }
     match IndexState::new(index.analyzer, index.positions, tuning) {
         Ok(state) => {
             let state = Arc::new(state);
-            states.insert(index_id, Arc::clone(&state));
+            states.write().unwrap().insert(index_id, Arc::clone(&state));
             Some(state)
         }
         Err(err) => {
@@ -813,12 +820,30 @@ fn get_or_create_state<T: TableSearch>(
 }
 
 fn get_state<T: TableSearch>(
-    states: &BTreeMap<IndexId, Arc<IndexState>>,
+    states: &States,
     table: &RwLock<T>,
     key: &IndexKey,
 ) -> Option<Arc<IndexState>> {
     let index_id = table.read().unwrap().index_id(key)?;
-    states.get(&index_id).cloned()
+    states.read().unwrap().get(&index_id).cloned()
+}
+
+/// Runs searches on the calling thread, against the states its actor keeps.
+///
+/// Each search takes the searcher of the latest reader reload, so it sees every commit
+/// and merge reload the actor has finished.
+struct TantivySearcher<T> {
+    states: Arc<States>,
+    table: Arc<RwLock<T>>,
+}
+
+impl<T: TableSearch> FtsSearch for TantivySearcher<T> {
+    fn search(&self, index_key: &IndexKey, query: &str, limit: Limit) -> FtsSearchR {
+        let Some(state) = get_state(&self.states, self.table.as_ref(), index_key) else {
+            return Ok((vec![], vec![]));
+        };
+        handle_search(&state, self.table.as_ref(), index_key, query, limit)
+    }
 }
 
 fn can_allocate_memory(
@@ -848,10 +873,14 @@ pub(crate) fn new(
     tuning: FtsTuning,
 ) -> mpsc::Sender<FtsIndex> {
     let (tx, mut rx) = mpsc::channel::<FtsIndex>(perf::channel_size().into());
+    let states: Arc<States> = Arc::default();
+    let searcher = Arc::new(TantivySearcher {
+        states: Arc::clone(&states),
+        table: Arc::clone(&table),
+    });
     tokio::spawn(async move {
         let key = index.key.clone();
         debug!("fts index actor starting for {key}");
-        let mut states: BTreeMap<IndexId, Arc<IndexState>> = BTreeMap::new();
 
         let mut allocate_prev = Allocate::Can;
         let allocate_rx = memory.subscribe_allocate().await;
@@ -872,7 +901,7 @@ pub(crate) fn new(
                             in_progress,
                         } => {
                             let Some(state) = get_or_create_state(
-                                &mut states,
+                                &states,
                                 table.as_ref(),
                                 &index,
                                 tuning,
@@ -902,7 +931,7 @@ pub(crate) fn new(
                             in_progress,
                         } => {
                             let Some(state) = get_or_create_state(
-                                &mut states,
+                                &states,
                                 table.as_ref(),
                                 &index,
                                 tuning,
@@ -932,21 +961,10 @@ pub(crate) fn new(
                             limit,
                             tx,
                         } => {
-                            let Some(state) = get_state(&states, table.as_ref(), &index_key) else {
-                                _ = tx.send(Ok((vec![], vec![])));
-                                continue;
-                            };
-                            let table = Arc::clone(&table);
+                            let searcher = Arc::clone(&searcher);
                             worker
                                 .spawn_blocking(move || {
-                                    let result = handle_search(
-                                        &state,
-                                        table.as_ref(),
-                                        &index_key,
-                                        &query,
-                                        limit,
-                                    );
-                                    _ = tx.send(result);
+                                    _ = tx.send(searcher.search(&index_key, &query, limit));
                                 })
                                 .await;
                         }
@@ -997,8 +1015,8 @@ pub(crate) fn new(
                     }
                 }
                 _ = interval.tick() => {
-                    for state in states.values() {
-                        let state = Arc::clone(state);
+                    let current: Vec<_> = states.read().unwrap().values().cloned().collect();
+                    for state in current {
                         let key = key.clone();
                         if state.writer.read().unwrap().has_uncommitted_docs() {
                             worker.spawn_blocking(move || commit(&state, &key)).await;
