@@ -34,7 +34,6 @@ use tantivy::index::SegmentMeta;
 use tantivy::indexer::IndexWriterOptions;
 use tantivy::indexer::LogMergePolicy;
 use tantivy::indexer::MergePolicy;
-use tantivy::indexer::NoMergePolicy;
 use tantivy::query::BooleanQuery;
 use tantivy::query::BoostQuery;
 use tantivy::query::Occur;
@@ -360,16 +359,30 @@ fn reload_after_merges(state: &IndexState, key: &IndexKey) {
 }
 
 /// Merge attempts that consolidation allows beyond the fewest it needs to reach its target.
-/// A merge fails harmlessly when a background merge, already running when consolidation
-/// began, replaces one of its input segments first.
+/// A merge can still fail, e.g. when a delete cannot be applied to its output.
 const MAX_FAILED_CONSOLIDATION_MERGES: usize = 3;
+
+/// How often consolidation checks whether the background merges it waits for have ended.
+const CONSOLIDATION_WAIT_POLL: Duration = Duration::from_millis(200);
+
+/// Waiting polls after which consolidation commits, so that tantivy offers the free segments
+/// again: it does so after every merge end, but not after a merge that fails.
+const CONSOLIDATION_WAIT_POLLS_PER_COMMIT: u64 = 25;
+
+/// What a consolidation did, for its log line and the tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ConsolidationOutcome {
+    merges: usize,
+    failed_merges: usize,
+    wait_polls: u64,
+}
 
 fn start_consolidation(
     state: &Arc<IndexState>,
     key: IndexKey,
     target: NonZeroUsize,
     allocate: watch::Receiver<Allocate>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<tokio::task::JoinHandle<ConsolidationOutcome>> {
     if state.consolidating.swap(true, Ordering::AcqRel) {
         debug!("fts: consolidation of {key} is already running");
         return None;
@@ -384,25 +397,36 @@ fn start_consolidation(
 
 /// Merges the index down to at most `target` segments, one bounded merge at a time.
 ///
-/// Tantivy's merge policy is off meanwhile, so it cannot start merges that race ours for
-/// the same segments. Weak, so that dropping the index stops the consolidation.
+/// Tantivy's merge policy is replaced meanwhile by one that starts no merges and reports
+/// the segments no merge holds. Consolidation merges only while no background merge runs,
+/// so it never races one for a segment, nor adds its output's memory to one's. The commit
+/// makes tantivy report them right away. Weak, so that dropping the index stops the
+/// consolidation.
 async fn consolidate(
     state: Weak<IndexState>,
     key: IndexKey,
     target: NonZeroUsize,
     allocate: watch::Receiver<Allocate>,
-) {
+) -> ConsolidationOutcome {
     info!("fts: consolidating {key} to at most {target} segments");
+    let policy = consolidation::ConsolidationPolicy::default();
+    let installed = policy.clone();
+    let start_key = key.clone();
     let Some(excess) = on_state(&state, move |state| {
-        set_merge_policy(state, Box::new(NoMergePolicy));
+        set_merge_policy(state, Box::new(installed));
+        commit(state, &start_key);
         searchable_segment_count(state).saturating_sub(target.get())
     })
     .await
     else {
-        return;
+        return ConsolidationOutcome::default();
     };
-    merge_down(&state, &key, target, &allocate, excess).await;
-    on_state(&state, move |state| finish_consolidation(state, &key)).await;
+    let outcome = merge_down(&state, &key, target, &allocate, &policy, excess).await;
+    on_state(&state, move |state| {
+        finish_consolidation(state, &key, outcome)
+    })
+    .await;
+    outcome
 }
 
 async fn merge_down(
@@ -410,26 +434,61 @@ async fn merge_down(
     key: &IndexKey,
     target: NonZeroUsize,
     allocate: &watch::Receiver<Allocate>,
+    policy: &consolidation::ConsolidationPolicy,
     excess: usize,
-) {
-    for _ in 0..excess + MAX_FAILED_CONSOLIDATION_MERGES {
+) -> ConsolidationOutcome {
+    let mut outcome = ConsolidationOutcome::default();
+    while outcome.merges < excess + MAX_FAILED_CONSOLIDATION_MERGES {
         if *allocate.borrow() == Allocate::Cannot {
             warn!("fts: stopping consolidation of {key}: not enough memory");
-            return;
+            break;
         }
-        let Some(merge) = on_state(state, move |state| start_next_merge(state, target)).await
+        let policy = policy.clone();
+        let Some(step) = on_state(state, move |state| {
+            next_consolidation_step(state, &policy, target)
+        })
+        .await
         else {
-            return;
+            break;
         };
-        match merge {
-            Ok(Some(merge)) => await_merge(state, key, merge).await,
-            Ok(None) => return,
+        match step {
+            Ok(consolidation::Step::Merge(merge)) => {
+                outcome.merges += 1;
+                if !await_merge(state, key, merge).await {
+                    outcome.failed_merges += 1;
+                }
+            }
+            Ok(consolidation::Step::Wait { busy }) => {
+                wait_for_background_merges(state, key, &mut outcome, busy).await;
+            }
+            Ok(consolidation::Step::Done) => break,
             Err(err) => {
                 error!("fts: failed to plan a consolidation merge for {key}: {err}");
-                return;
+                break;
             }
         }
     }
+    outcome
+}
+
+async fn wait_for_background_merges(
+    state: &Weak<IndexState>,
+    key: &IndexKey,
+    outcome: &mut ConsolidationOutcome,
+    busy: usize,
+) {
+    if outcome.wait_polls == 0 {
+        info!("fts: consolidation of {key} waits for background merges of {busy} segments");
+    }
+    outcome.wait_polls += 1;
+    if outcome
+        .wait_polls
+        .is_multiple_of(CONSOLIDATION_WAIT_POLLS_PER_COMMIT)
+    {
+        let key = key.clone();
+        on_state(state, move |state| commit(state, &key)).await;
+    }
+    tokio::time::sleep(CONSOLIDATION_WAIT_POLL).await;
 }
 
 /// Reloads after each merge rather than on the next tick, so the reader releases the
@@ -438,13 +497,14 @@ async fn await_merge(
     state: &Weak<IndexState>,
     key: &IndexKey,
     merge: FutureResult<Option<SegmentMeta>>,
-) {
+) -> bool {
     if let Err(err) = merge.await {
         warn!("fts: consolidation merge for {key} failed: {err}");
-        return;
+        return false;
     }
     let key = key.clone();
     on_state(state, move |state| reload_after_merges(state, &key)).await;
+    true
 }
 
 /// Runs `f` on a blocking thread: the writer lock it may take is held across whole commits.
@@ -456,18 +516,22 @@ async fn on_state<R: Send + 'static>(
     tokio::task::spawn_blocking(move || f(&state)).await.ok()
 }
 
-fn start_next_merge(
+/// Starts the next consolidation merge, if the segments it needs are free.
+fn next_consolidation_step(
     state: &IndexState,
+    policy: &consolidation::ConsolidationPolicy,
     target: NonZeroUsize,
-) -> tantivy::Result<Option<FutureResult<Option<SegmentMeta>>>> {
+) -> tantivy::Result<consolidation::Step<FutureResult<Option<SegmentMeta>>>> {
     let segments: Vec<_> = state
         .index
         .searchable_segment_metas()?
         .iter()
         .map(|meta| (meta.id(), u64::from(meta.num_docs())))
         .collect();
-    Ok(consolidation::next_merge(&segments, target)
-        .map(|segment_ids| state.writer.write().unwrap().writer.merge(&segment_ids)))
+    Ok(
+        consolidation::next_step(&segments, &policy.free_segments(), target)
+            .map_merge(|segment_ids| state.writer.write().unwrap().writer.merge(&segment_ids)),
+    )
 }
 
 fn set_merge_policy(state: &IndexState, policy: Box<dyn MergePolicy>) {
@@ -482,12 +546,16 @@ fn searchable_segment_count(state: &IndexState) -> usize {
         .unwrap_or(0)
 }
 
-fn finish_consolidation(state: &IndexState, key: &IndexKey) {
+fn finish_consolidation(state: &IndexState, key: &IndexKey, outcome: ConsolidationOutcome) {
     set_merge_policy(state, Box::new(LogMergePolicy::default()));
     reload_after_merges(state, key);
     state.consolidating.store(false, Ordering::Release);
     info!(
-        "fts: consolidation of {key} finished, serving {} segments",
+        "fts: consolidation of {key} finished after {} merges ({} failed, {} waiting polls), \
+         serving {} segments",
+        outcome.merges,
+        outcome.failed_merges,
+        outcome.wait_polls,
         state.reader.searcher().segment_readers().len()
     );
 }
@@ -1614,14 +1682,17 @@ mod tests {
     fn spawn_consolidation(
         state: &Arc<IndexState>,
         allocate: Allocate,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+    ) -> Option<tokio::task::JoinHandle<ConsolidationOutcome>> {
+        spawn_consolidation_to(state, allocate, CONSOLIDATION_TEST_TARGET)
+    }
+
+    fn spawn_consolidation_to(
+        state: &Arc<IndexState>,
+        allocate: Allocate,
+        target: NonZeroUsize,
+    ) -> Option<tokio::task::JoinHandle<ConsolidationOutcome>> {
         let (_allocate_tx, allocate_rx) = watch::channel(allocate);
-        start_consolidation(
-            state,
-            make_index_key(),
-            CONSOLIDATION_TEST_TARGET,
-            allocate_rx,
-        )
+        start_consolidation(state, make_index_key(), target, allocate_rx)
     }
 
     #[rstest]
@@ -1765,6 +1836,77 @@ mod tests {
             CONSOLIDATION_TEST_SEGMENTS
         );
         assert!(!state.consolidating.load(Ordering::Acquire));
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn consolidation_policy_is_offered_the_committed_segments() {
+        let state = state_with_committed_segments();
+        let policy = consolidation::ConsolidationPolicy::default();
+
+        set_merge_policy(&state, Box::new(policy.clone()));
+        commit(&state, &make_index_key());
+
+        let free: BTreeSet<_> = policy.free_segments().into_iter().collect();
+        assert_eq!(free, searchable_segment_ids(&state));
+    }
+
+    /// Large enough that the background merge of the small segments is still running when
+    /// consolidation plans, and that a merge of every segment outlasts it.
+    const RACE_TEST_SMALL_SEGMENT_DOCS: u64 = 2_000;
+    /// Ten times the small segments, so the merge policy keeps them out of the small ones' level.
+    const RACE_TEST_LARGE_SEGMENT_DOCS: u64 = 20_000;
+    const RACE_TEST_LARGE_SEGMENTS: u64 = 2;
+    const RACE_TEST_DOCS: u64 = RACE_TEST_LARGE_SEGMENTS * RACE_TEST_LARGE_SEGMENT_DOCS
+        + MERGE_POLICY_MIN_NUM_SEGMENTS * RACE_TEST_SMALL_SEGMENT_DOCS;
+
+    fn commit_segments_of(state: &IndexState, segments: u64, docs_per_segment: u64, first: u64) {
+        for segment in 0..segments {
+            let start = first + segment * docs_per_segment;
+            commit_segment_of_docs(state, start..start + docs_per_segment);
+        }
+    }
+
+    /// The last of the small segments starts a background merge of all of them, which is
+    /// still running when this returns.
+    fn state_with_a_background_merge_running() -> Arc<IndexState> {
+        let state = IndexState::new(
+            Analyzer::default(),
+            Positions::default(),
+            FtsTuning::default(),
+        )
+        .unwrap();
+        let large_docs = RACE_TEST_LARGE_SEGMENTS * RACE_TEST_LARGE_SEGMENT_DOCS;
+        commit_segments_of(
+            &state,
+            RACE_TEST_LARGE_SEGMENTS,
+            RACE_TEST_LARGE_SEGMENT_DOCS,
+            0,
+        );
+        commit_segments_of(
+            &state,
+            MERGE_POLICY_MIN_NUM_SEGMENTS,
+            RACE_TEST_SMALL_SEGMENT_DOCS,
+            large_docs,
+        );
+        Arc::new(state)
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(30))]
+    #[tokio::test]
+    async fn consolidation_waits_for_a_background_merge_instead_of_racing_it() {
+        let state = state_with_a_background_merge_running();
+
+        let outcome = spawn_consolidation_to(&state, Allocate::Can, NonZeroUsize::MIN)
+            .unwrap()
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.failed_merges, 0, "{outcome:?}");
+        assert_eq!(served_segment_ids(&state).len(), 1);
+        assert_eq!(state.reader.searcher().num_docs(), RACE_TEST_DOCS);
     }
 
     #[rstest]
