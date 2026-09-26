@@ -104,10 +104,11 @@ secrecy = "0.10.3"
 [patch.crates-io]
 # Currently, axum-server-dual-protocol doesn't have a published version that supports axum 0.8, so we need to use the git version from the PR.
 axum-server-dual-protocol = { git = "https://github.com/vinchona/axum-server-dual-protocol", rev = "ca6db055254255b74238673ce4135698e347d71c" }
-# The sibling checkout ../tantivy-p99-r9a is crates.io tantivy 0.26.1 plus, in order,
-# patches/tantivy-0.26.1-phrase-pruning.patch: top-K pruning for phrase queries (tantivy#2518), and
-# patches/tantivy-0.26.1-bool-not-pruning.patch: block-max top-K pruning for boolean queries with MustNot.
-tantivy = { path = "../tantivy-p99-r9a" }
+# The sibling checkout ../tantivy-p99-r10b is crates.io tantivy 0.26.1 plus, in order,
+# patches/tantivy-0.26.1-phrase-pruning.patch: top-K pruning for phrase queries (tantivy#2518),
+# patches/tantivy-0.26.1-bool-not-pruning.patch: block-max top-K pruning for boolean queries with MustNot, and
+# patches/tantivy-0.26.1-and-block-max.patch: block-max conjunction for top-K intersections of MUST terms.
+tantivy = { path = "../tantivy-p99-r10b" }
 
 [profile.dev]
 opt-level = 1

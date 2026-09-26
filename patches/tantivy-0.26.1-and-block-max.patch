@@ -1,0 +1,738 @@
+# Block-max conjunction for top-K boolean queries whose include is an intersection of terms, Tantivy 0.26.1
+# Base: tantivy 0.26.1 (crates.io) plus tantivy-0.26.1-phrase-pruning.patch and tantivy-0.26.1-bool-not-pruning.patch
+# Two or more MUST term clauses that read frequencies (`a AND b`, `+a +b +c`), with no SHOULD clause, run
+# block_max_conjunction: windows whose summed block maxima cannot beat the threshold are skipped without
+# decoding, and a candidate stops being sought as soon as its partial score cannot beat it. With MUST_NOT
+# clauses the exclusion set filters the callback, as for the bool-not patch.
+# Apply after the bool-not patch with: git apply -p1 tantivy-0.26.1-and-block-max.patch
+
+diff --git a/src/query/boolean_query/block_max_conjunction.rs b/src/query/boolean_query/block_max_conjunction.rs
+new file mode 100644
+index 0000000..8411811
+--- /dev/null
++++ b/src/query/boolean_query/block_max_conjunction.rs
+@@ -0,0 +1,155 @@
++use crate::query::term_query::TermScorer;
++use crate::query::Scorer;
++use crate::{DocId, DocSet, Score, TERMINATED};
++
++/// A range of doc ids `[target, last_doc]` inside which every clause stays in one block, so
++/// that each clause's block max bounds its score over the whole range.
++struct Window {
++    last_doc: DocId,
++    /// `remaining_max[i]` bounds the summed score of the clauses after clause `i`.
++    remaining_max: Vec<Score>,
++}
++
++enum Candidate {
++    Matched(Score),
++    Pruned,
++    Missed(DocId),
++}
++
++impl Window {
++    fn new(num_clauses: usize) -> Window {
++        Window {
++            last_doc: TERMINATED,
++            remaining_max: vec![0.0; num_clauses],
++        }
++    }
++
++    /// Moves every clause's skip reader to the block holding `target` without decoding it, and
++    /// returns the sum of the block maxima over the new window.
++    fn shallow_seek(&mut self, scorers: &mut [TermScorer], target: DocId) -> Score {
++        self.last_doc = TERMINATED;
++        let mut window_max: Score = 0.0;
++        for (ord, scorer) in scorers.iter_mut().enumerate().rev() {
++            scorer.seek_block(target);
++            self.last_doc = self.last_doc.min(scorer.last_doc_in_block());
++            self.remaining_max[ord] = window_max;
++            window_max += scorer.block_max_score();
++        }
++        window_max
++    }
++
++    fn doc_after(&self) -> DocId {
++        if self.last_doc == TERMINATED {
++            TERMINATED
++        } else {
++            self.last_doc + 1
++        }
++    }
++
++    fn contains(&self, doc: DocId) -> bool {
++        doc <= self.last_doc && doc != TERMINATED
++    }
++}
++
++/// Top-k walk over the intersection of two or more term scorers, after Lucene's block-max
++/// conjunction.
++///
++/// - At a candidate, every clause moves its skip reader to the block holding it without decoding
++///   (`seek_block`). The window ends at the first `last_doc_in_block` among them.
++/// - When the sum of the clauses' block maxima cannot beat the threshold, the whole window is
++///   skipped.
++/// - Otherwise the walk leapfrogs inside the window. The lead, the cheapest clause, is scored
++///   first, and a candidate is dropped as soon as its partial score plus the remaining clauses'
++///   block maxima cannot beat the threshold, before those clauses are sought.
++///
++/// Clauses are ordered and their scores summed as in `intersect_scorers` and
++/// `Intersection::score`, so every score passed to `callback` is bit-identical to the unpruned
++/// walk's. Documents are passed in increasing order, and only when their score is above the
++/// threshold.
++pub(crate) fn block_max_conjunction(
++    mut scorers: Vec<TermScorer>,
++    mut threshold: Score,
++    callback: &mut dyn FnMut(DocId, Score) -> Score,
++) {
++    debug_assert!(scorers.len() >= 2);
++    scorers.sort_by_key(|scorer| scorer.cost());
++    let mut window = Window::new(scorers.len());
++    let mut clause_scores: Vec<Score> = vec![0.0; scorers.len()];
++    let mut target = scorers.iter().map(DocSet::doc).max().unwrap_or(TERMINATED);
++    while target != TERMINATED {
++        let window_max = window.shallow_seek(&mut scorers, target);
++        target = if window_max <= threshold {
++            window.doc_after()
++        } else {
++            walk_window(
++                &mut scorers,
++                target,
++                &window,
++                &mut clause_scores,
++                &mut threshold,
++                callback,
++            )
++        };
++    }
++}
++
++/// Walks the candidates of `window` from `target` and returns the first doc id past it.
++///
++/// On entry and on return, no clause is positioned past the returned doc id, which is what
++/// `seek` requires of the next window's target.
++fn walk_window(
++    scorers: &mut [TermScorer],
++    target: DocId,
++    window: &Window,
++    clause_scores: &mut [Score],
++    threshold: &mut Score,
++    callback: &mut dyn FnMut(DocId, Score) -> Score,
++) -> DocId {
++    let mut doc = scorers[0].seek(target);
++    while window.contains(doc) {
++        doc = match align_and_score(scorers, doc, window, clause_scores, *threshold) {
++            Candidate::Matched(score) => {
++                if score > *threshold {
++                    *threshold = callback(doc, score);
++                }
++                scorers[0].advance()
++            }
++            Candidate::Pruned => scorers[0].advance(),
++            Candidate::Missed(next) if window.contains(next) => scorers[0].seek(next),
++            Candidate::Missed(next) => return next,
++        };
++    }
++    doc
++}
++
++/// Scores the lead on `doc`, then seeks and scores the other clauses one by one, stopping as
++/// soon as the candidate is missing from a clause or can no longer beat `threshold`.
++fn align_and_score(
++    scorers: &mut [TermScorer],
++    doc: DocId,
++    window: &Window,
++    clause_scores: &mut [Score],
++    threshold: Score,
++) -> Candidate {
++    let last_ord = scorers.len() - 1;
++    let mut partial_score: Score = 0.0;
++    for (ord, scorer) in scorers.iter_mut().enumerate() {
++        if ord > 0 {
++            let clause_doc = scorer.seek(doc);
++            if clause_doc != doc {
++                return Candidate::Missed(clause_doc);
++            }
++        }
++        clause_scores[ord] = scorer.score();
++        partial_score += clause_scores[ord];
++        if ord < last_ord && partial_score + window.remaining_max[ord] <= threshold {
++            return Candidate::Pruned;
++        }
++    }
++    Candidate::Matched(intersection_score(clause_scores))
++}
++
++/// The sum in the association `Intersection::score` uses: `left + right + sum(others)`.
++fn intersection_score(clause_scores: &[Score]) -> Score {
++    clause_scores[0] + clause_scores[1] + clause_scores[2..].iter().sum::<Score>()
++}
+diff --git a/src/query/boolean_query/block_wand.rs b/src/query/boolean_query/block_wand.rs
+index 76ec258..ab1daab 100644
+--- a/src/query/boolean_query/block_wand.rs
++++ b/src/query/boolean_query/block_wand.rs
+@@ -310,10 +310,12 @@ mod tests {
+     use crate::collector::sort_key::NaturalComparator;
+     use crate::collector::TopNComputer;
+     use crate::query::boolean_query::excluding_pruner::assert_same_top_k;
+-    use crate::query::boolean_query::{for_each_pruning_excluding, PrunableInclude};
++    use crate::query::boolean_query::{
++        block_max_conjunction, for_each_pruning_excluding, PrunableInclude,
++    };
+     use crate::query::score_combiner::SumCombiner;
+     use crate::query::term_query::TermScorer;
+-    use crate::query::{Bm25Weight, BufferedUnionScorer, Exclude, Scorer, VecDocSet};
++    use crate::query::{Bm25Weight, BufferedUnionScorer, Exclude, Intersection, Scorer, VecDocSet};
+     use crate::{DocId, DocSet, Score, TERMINATED};
+ 
+     struct Float(Score);
+@@ -570,6 +572,29 @@ mod tests {
+             .collect()
+     }
+ 
++    /// Top k of a pruning walk that reads the collector's threshold back after each hit.
++    fn top_k_of_pruning_walk(
++        k: usize,
++        walk: impl FnOnce(&mut dyn FnMut(DocId, Score) -> Score),
++    ) -> Vec<(Score, DocId)> {
++        let mut top_n = TopNComputer::new_with_comparator(k, NaturalComparator);
++        walk(&mut |doc, score| {
++            top_n.push(score, doc);
++            top_n.threshold.unwrap_or(Score::MIN)
++        });
++        into_sorted_hits(top_n)
++    }
++
++    /// Top k of every document of `scorer`, with no pruning.
++    fn top_k_of_scorer(mut scorer: impl Scorer, k: usize) -> Vec<(Score, DocId)> {
++        let mut top_n = TopNComputer::new_with_comparator(k, NaturalComparator);
++        while scorer.doc() != TERMINATED {
++            top_n.push(scorer.score(), scorer.doc());
++            scorer.advance();
++        }
++        into_sorted_hits(top_n)
++    }
++
+     fn top_k_excluding_pruned(
+         mut term_scorers: Vec<TermScorer>,
+         exclusion: &[DocId],
+@@ -580,13 +605,10 @@ mod tests {
+         } else {
+             PrunableInclude::TermUnion(term_scorers)
+         };
+-        let mut top_n = TopNComputer::new_with_comparator(k, NaturalComparator);
+         let exclusion = VecDocSet::from(exclusion.to_vec());
+-        for_each_pruning_excluding(include, exclusion, Score::MIN, &mut |doc, score| {
+-            top_n.push(score, doc);
+-            top_n.threshold.unwrap_or(Score::MIN)
+-        });
+-        into_sorted_hits(top_n)
++        top_k_of_pruning_walk(k, |callback| {
++            for_each_pruning_excluding(include, exclusion, Score::MIN, callback)
++        })
+     }
+ 
+     fn top_k_excluding_naive(
+@@ -596,13 +618,7 @@ mod tests {
+         max_doc: usize,
+     ) -> Vec<(Score, DocId)> {
+         let union = BufferedUnionScorer::build(term_scorers, SumCombiner::default, max_doc as u32);
+-        let mut scorer = Exclude::new(union, VecDocSet::from(exclusion.to_vec()));
+-        let mut top_n = TopNComputer::new_with_comparator(k, NaturalComparator);
+-        while scorer.doc() != TERMINATED {
+-            top_n.push(scorer.score(), scorer.doc());
+-            scorer.advance();
+-        }
+-        into_sorted_hits(top_n)
++        top_k_of_scorer(Exclude::new(union, VecDocSet::from(exclusion.to_vec())), k)
+     }
+ 
+     fn test_block_wand_excluding_aux(
+@@ -638,6 +654,80 @@ mod tests {
+         }
+     }
+ 
++    const CONJUNCTION_TOP_KS: [usize; 4] = [1, 5, 10, 1000];
++
++    fn top_k_conjunction_pruned(term_scorers: Vec<TermScorer>, k: usize) -> Vec<(Score, DocId)> {
++        top_k_of_pruning_walk(k, |callback| {
++            block_max_conjunction(term_scorers, Score::MIN, callback)
++        })
++    }
++
++    fn top_k_conjunction_naive(
++        term_scorers: Vec<TermScorer>,
++        k: usize,
++        max_doc: usize,
++    ) -> Vec<(Score, DocId)> {
++        top_k_of_scorer(Intersection::new(term_scorers, max_doc as u32), k)
++    }
++
++    /// The pruned walk sums clause scores in the order `Intersection::score` does, so the
++    /// score lists must be bit-identical, not only nearly equal.
++    fn assert_identical_scores(pruned: &[(Score, DocId)], naive: &[(Score, DocId)], context: &str) {
++        let bits = |hits: &[(Score, DocId)]| -> Vec<u32> {
++            hits.iter().map(|(score, _)| score.to_bits()).collect()
++        };
++        assert_eq!(bits(pruned), bits(naive), "{context}: score bits differ");
++    }
++
++    fn test_block_max_conjunction_aux(posting_lists: &[Vec<(DocId, u32)>], fieldnorms: &[u32]) {
++        let (term_scorers, max_doc) = expanded_term_scorers(posting_lists, fieldnorms);
++        for k in CONJUNCTION_TOP_KS {
++            let pruned = top_k_conjunction_pruned(term_scorers.clone(), k);
++            let naive = top_k_conjunction_naive(term_scorers.clone(), k, max_doc);
++            let context = format!("k={k}");
++            assert_same_top_k(&pruned, &naive, k, &context);
++            assert_identical_scores(&pruned, &naive, &context);
++        }
++    }
++
++    proptest! {
++        #![proptest_config(ProptestConfig::with_cases(500))]
++        #[test]
++        fn test_block_max_conjunction_two_term_scorers(
++            (posting_lists, fieldnorms) in gen_term_scorers(2)
++        ) {
++            test_block_max_conjunction_aux(&posting_lists[..], &fieldnorms[..]);
++        }
++    }
++
++    proptest! {
++        #![proptest_config(ProptestConfig::with_cases(500))]
++        #[test]
++        fn test_block_max_conjunction_three_term_scorers(
++            (posting_lists, fieldnorms) in gen_term_scorers(3)
++        ) {
++            test_block_max_conjunction_aux(&posting_lists[..], &fieldnorms[..]);
++        }
++    }
++
++    #[test]
++    fn test_block_max_conjunction_skips_everything_under_an_unbeatable_threshold() {
++        let (term_scorers, _) = expanded_term_scorers(
++            &[
++                vec![(0, 3), (1, 5), (7, 2)],
++                vec![(0, 1), (1, 9), (4, 4), (7, 1)],
++            ],
++            &[10, 20, 30, 40, 50, 60, 70, 80],
++        );
++        let unbeatable: Score = term_scorers.iter().map(TermScorer::max_score).sum();
++        let mut calls = 0;
++        block_max_conjunction(term_scorers, unbeatable, &mut |_, _| {
++            calls += 1;
++            unbeatable
++        });
++        assert_eq!(calls, 0);
++    }
++
+     #[test]
+     fn test_fn_reproduce_proptest() {
+         let postings_lists = &[
+diff --git a/src/query/boolean_query/boolean_weight.rs b/src/query/boolean_query/boolean_weight.rs
+index 6c5aedd..4e7b65c 100644
+--- a/src/query/boolean_query/boolean_weight.rs
++++ b/src/query/boolean_query/boolean_weight.rs
+@@ -18,6 +18,7 @@ use super::{for_each_pruning_excluding, ExclusionScorers, PrunableInclude};
+ 
+ enum SpecializedScorer {
+     TermUnion(Vec<TermScorer>),
++    TermIntersection(Vec<TermScorer>),
+     Other(Box<dyn Scorer>),
+ }
+ 
+@@ -69,6 +70,9 @@ impl ScorerParts {
+ fn prunable_include(include: SpecializedScorer) -> Result<PrunableInclude, SpecializedScorer> {
+     match include {
+         SpecializedScorer::TermUnion(term_scorers) => Ok(PrunableInclude::TermUnion(term_scorers)),
++        SpecializedScorer::TermIntersection(term_scorers) => {
++            Ok(PrunableInclude::TermIntersection(term_scorers))
++        }
+         SpecializedScorer::Other(scorer) => match scorer.downcast::<TermScorer>() {
+             Ok(term_scorer) if term_scorer.freq_reading_option() == FreqReadingOption::ReadFreq => {
+                 Ok(PrunableInclude::SingleTerm(term_scorer))
+@@ -153,10 +157,49 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
+                 BufferedUnionScorer::build(term_scorers, score_combiner_fn, num_docs);
+             Box::new(union_scorer)
+         }
++        SpecializedScorer::TermIntersection(term_scorers) => {
++            intersect_term_scorers(term_scorers, num_docs)
++        }
+         SpecializedScorer::Other(scorer) => scorer,
+     }
+ }
+ 
++fn intersect_term_scorers(term_scorers: Vec<TermScorer>, num_docs: u32) -> Box<dyn Scorer> {
++    let boxed_scorers = term_scorers
++        .into_iter()
++        .map(|term_scorer| Box::new(term_scorer) as Box<dyn Scorer>)
++        .collect();
++    intersect_scorers(boxed_scorers, num_docs)
++}
++
++/// Keeps two or more MUST term scorers unboxed, so that `for_each_pruning` can walk them with
++/// the block-max conjunction. Block-max scores are only meaningful when term frequencies are read.
++/// Returns the scorers unchanged for any other shape.
++fn term_intersection(
++    must_scorers: Vec<Box<dyn Scorer>>,
++    removed_all_scorer_count: usize,
++) -> Result<SpecializedScorer, Vec<Box<dyn Scorer>>> {
++    let is_prunable = removed_all_scorer_count == 0
++        && must_scorers.len() >= 2
++        && must_scorers
++            .iter()
++            .all(|scorer| is_term_scorer_reading_freqs(scorer.as_ref()));
++    if !is_prunable {
++        return Err(must_scorers);
++    }
++    let term_scorers = must_scorers
++        .into_iter()
++        .map(|scorer| *(scorer.downcast::<TermScorer>().map_err(|_| ()).unwrap()))
++        .collect();
++    Ok(SpecializedScorer::TermIntersection(term_scorers))
++}
++
++fn is_term_scorer_reading_freqs(scorer: &dyn Scorer) -> bool {
++    scorer
++        .downcast_ref::<TermScorer>()
++        .is_some_and(|term_scorer| term_scorer.freq_reading_option() == FreqReadingOption::ReadFreq)
++}
++
+ /// Returns the effective MUST scorer, accounting for removed AllScorers.
+ ///
+ /// When AllScorer instances are removed from must_scorers as an optimization,
+@@ -367,14 +410,19 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
+                 // Result depends entirely on MUST + any removed AllScorers.
+                 let combined_all_scorer_count = must_special_scorer_counts.num_all_scorers
+                     + should_special_scorer_counts.num_all_scorers;
+-                let boxed_scorer: Box<dyn Scorer> = effective_must_scorer(
+-                    must_scorers,
+-                    combined_all_scorer_count,
+-                    reader.max_doc(),
+-                    num_docs,
+-                )
+-                .unwrap_or_else(|| Box::new(EmptyScorer));
+-                SpecializedScorer::Other(boxed_scorer)
++                match term_intersection(must_scorers, combined_all_scorer_count) {
++                    Ok(term_intersection) => term_intersection,
++                    Err(must_scorers) => {
++                        let boxed_scorer: Box<dyn Scorer> = effective_must_scorer(
++                            must_scorers,
++                            combined_all_scorer_count,
++                            reader.max_doc(),
++                            num_docs,
++                        )
++                        .unwrap_or_else(|| Box::new(EmptyScorer));
++                        SpecializedScorer::Other(boxed_scorer)
++                    }
++                }
+             }
+             (ShouldScorersCombinationMethod::Optional(should_scorer), must_scorers) => {
+                 // Optional SHOULD: contributes to scoring but not required for matching.
+@@ -529,6 +577,10 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
+                 );
+                 for_each_scorer(&mut union_scorer, callback);
+             }
++            SpecializedScorer::TermIntersection(term_scorers) => {
++                let mut scorer = intersect_term_scorers(term_scorers, reader.num_docs());
++                for_each_scorer(scorer.as_mut(), callback);
++            }
+             SpecializedScorer::Other(mut scorer) => {
+                 for_each_scorer(scorer.as_mut(), callback);
+             }
+@@ -553,6 +605,10 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
+                 );
+                 for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
+             }
++            SpecializedScorer::TermIntersection(term_scorers) => {
++                let mut scorer = intersect_term_scorers(term_scorers, reader.num_docs());
++                for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
++            }
+             SpecializedScorer::Other(mut scorer) => {
+                 for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
+             }
+@@ -573,6 +629,9 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
+     ///
+     /// A term or term-union include with `MustNot` clauses is walked with BlockWAND too,
+     /// and the exclusion is applied only to the documents that beat the threshold.
++    ///
++    /// An intersection of MUST term clauses, with or without `MustNot` clauses, is walked with
++    /// the block-max conjunction.
+     fn for_each_pruning(
+         &self,
+         threshold: Score,
+@@ -592,6 +651,9 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
+             SpecializedScorer::TermUnion(term_scorers) => {
+                 super::block_wand(term_scorers, threshold, callback);
+             }
++            SpecializedScorer::TermIntersection(term_scorers) => {
++                super::block_max_conjunction(term_scorers, threshold, callback);
++            }
+             SpecializedScorer::Other(mut scorer) => {
+                 for_each_pruning_scorer(scorer.as_mut(), threshold, callback);
+             }
+@@ -610,11 +672,11 @@ fn is_include_occur(occur: Occur) -> bool {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::query::{EnableScoring, Query, SumCombiner, TermQuery};
+-    use crate::schema::{IndexRecordOption, Schema, TEXT};
+-    use crate::{Index, IndexWriter, Term};
++    use crate::query::{BooleanQuery, EnableScoring, Query, SumCombiner, TermQuery};
++    use crate::schema::{Field, IndexRecordOption, Schema, TEXT};
++    use crate::{Index, IndexWriter, Searcher, Term};
+ 
+-    fn takes_excluding_pruner(clauses: &[(Occur, &str)]) -> crate::Result<bool> {
++    fn test_searcher() -> crate::Result<(Searcher, Field)> {
+         let mut schema_builder = Schema::builder();
+         let text = schema_builder.add_text_field("text", TEXT);
+         let index = Index::create_in_ram(schema_builder.build());
+@@ -622,15 +684,21 @@ mod tests {
+         writer.add_document(doc!(text => "a b c"))?;
+         writer.add_document(doc!(text => "a c"))?;
+         writer.commit()?;
+-        let searcher = index.reader()?.searcher();
+-        let scoring = EnableScoring::enabled_from_searcher(&searcher);
++        Ok((index.reader()?.searcher(), text))
++    }
++
++    fn term_query(text: Field, word: &str, option: IndexRecordOption) -> Box<dyn Query> {
++        Box::new(TermQuery::new(Term::from_field_text(text, word), option))
++    }
++
++    fn scorer_parts_of(
++        searcher: &Searcher,
++        clauses: Vec<(Occur, Box<dyn Query>)>,
++    ) -> crate::Result<ScorerParts> {
++        let scoring = EnableScoring::enabled_from_searcher(searcher);
+         let weights = clauses
+-            .iter()
+-            .map(|&(occur, word)| {
+-                let term = Term::from_field_text(text, word);
+-                let query = TermQuery::new(term, IndexRecordOption::WithFreqs);
+-                Ok((occur, query.weight(scoring)?))
+-            })
++            .into_iter()
++            .map(|(occur, query)| Ok((occur, query.weight(scoring)?)))
+             .collect::<crate::Result<Vec<_>>>()?;
+         let weight = BooleanWeight::with_minimum_number_should_match(
+             weights,
+@@ -638,11 +706,42 @@ mod tests {
+             true,
+             Box::new(SumCombiner::default),
+         );
+-        let parts =
+-            weight.complex_scorer_parts(searcher.segment_reader(0), 1.0, SumCombiner::default)?;
++        weight.complex_scorer_parts(searcher.segment_reader(0), 1.0, SumCombiner::default)
++    }
++
++    fn term_scorer_parts(
++        clauses: &[(Occur, &str)],
++        option: IndexRecordOption,
++    ) -> crate::Result<ScorerParts> {
++        let (searcher, text) = test_searcher()?;
++        let clauses = clauses
++            .iter()
++            .map(|&(occur, word)| (occur, term_query(text, word, option)))
++            .collect();
++        scorer_parts_of(&searcher, clauses)
++    }
++
++    fn takes_excluding_pruner(clauses: &[(Occur, &str)]) -> crate::Result<bool> {
++        let parts = term_scorer_parts(clauses, IndexRecordOption::WithFreqs)?;
+         Ok(parts.into_excluding_pruner().is_ok())
+     }
+ 
++    fn is_block_max_conjunction(parts: ScorerParts) -> bool {
++        match parts.into_excluding_pruner() {
++            Ok((include, _)) => matches!(include, PrunableInclude::TermIntersection(_)),
++            Err(parts) => matches!(parts.include, SpecializedScorer::TermIntersection(_)),
++        }
++    }
++
++    fn takes_block_max_conjunction(
++        clauses: &[(Occur, &str)],
++        option: IndexRecordOption,
++    ) -> crate::Result<bool> {
++        Ok(is_block_max_conjunction(term_scorer_parts(
++            clauses, option,
++        )?))
++    }
++
+     #[test]
+     fn test_term_include_with_exclusion_takes_excluding_pruner() -> crate::Result<()> {
+         assert!(takes_excluding_pruner(&[
+@@ -672,12 +771,17 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_other_shapes_keep_existing_path() -> crate::Result<()> {
+-        assert!(!takes_excluding_pruner(&[
++    fn test_term_intersection_with_exclusion_takes_excluding_pruner() -> crate::Result<()> {
++        assert!(takes_excluding_pruner(&[
+             (Occur::Must, "a"),
+             (Occur::Must, "c"),
+             (Occur::MustNot, "b")
+         ])?);
++        Ok(())
++    }
++
++    #[test]
++    fn test_other_shapes_keep_existing_path() -> crate::Result<()> {
+         assert!(!takes_excluding_pruner(&[
+             (Occur::Should, "a"),
+             (Occur::Should, "b")
+@@ -688,4 +792,73 @@ mod tests {
+         ])?);
+         Ok(())
+     }
++
++    #[test]
++    fn test_must_term_intersections_take_block_max_conjunction() -> crate::Result<()> {
++        let with_freqs = IndexRecordOption::WithFreqs;
++        assert!(takes_block_max_conjunction(
++            &[(Occur::Must, "a"), (Occur::Must, "b")],
++            with_freqs
++        )?);
++        assert!(takes_block_max_conjunction(
++            &[(Occur::Must, "a"), (Occur::Must, "b"), (Occur::Must, "c")],
++            with_freqs
++        )?);
++        assert!(takes_block_max_conjunction(
++            &[
++                (Occur::Must, "a"),
++                (Occur::Must, "c"),
++                (Occur::MustNot, "b")
++            ],
++            with_freqs
++        )?);
++        Ok(())
++    }
++
++    #[test]
++    fn test_other_term_shapes_do_not_take_block_max_conjunction() -> crate::Result<()> {
++        let with_freqs = IndexRecordOption::WithFreqs;
++        for clauses in [
++            &[(Occur::Must, "a")][..],
++            &[(Occur::Must, "a"), (Occur::MustNot, "b")],
++            &[(Occur::Must, "a"), (Occur::Should, "b")],
++            &[(Occur::Should, "a"), (Occur::Should, "b")],
++            &[(Occur::Must, "a"), (Occur::Must, "b"), (Occur::Should, "c")],
++        ] {
++            assert!(
++                !takes_block_max_conjunction(clauses, with_freqs)?,
++                "{clauses:?}"
++            );
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn test_term_intersection_without_freqs_does_not_take_block_max_conjunction(
++    ) -> crate::Result<()> {
++        assert!(!takes_block_max_conjunction(
++            &[(Occur::Must, "a"), (Occur::Must, "b")],
++            IndexRecordOption::Basic
++        )?);
++        Ok(())
++    }
++
++    #[test]
++    fn test_intersection_with_a_non_term_clause_does_not_take_block_max_conjunction(
++    ) -> crate::Result<()> {
++        let (searcher, text) = test_searcher()?;
++        let with_freqs = IndexRecordOption::WithFreqs;
++        let nested: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
++            (Occur::Should, term_query(text, "b", with_freqs)),
++            (Occur::Should, term_query(text, "c", with_freqs)),
++        ]));
++        let clauses = vec![
++            (Occur::Must, term_query(text, "a", with_freqs)),
++            (Occur::Must, nested),
++        ];
++        assert!(!is_block_max_conjunction(scorer_parts_of(
++            &searcher, clauses
++        )?));
++        Ok(())
++    }
+ }
+diff --git a/src/query/boolean_query/excluding_pruner.rs b/src/query/boolean_query/excluding_pruner.rs
+index f20cbca..a956a54 100644
+--- a/src/query/boolean_query/excluding_pruner.rs
++++ b/src/query/boolean_query/excluding_pruner.rs
+@@ -1,12 +1,14 @@
+-use crate::query::boolean_query::{block_wand, block_wand_single_scorer};
++use crate::query::boolean_query::{block_max_conjunction, block_wand, block_wand_single_scorer};
+ use crate::query::term_query::TermScorer;
+ use crate::query::{Exclude, ExclusionSet, Scorer};
+ use crate::{DocId, Score};
+ 
+-/// The include part of a boolean query that block-max WAND can walk.
++/// The include part of a boolean query that block-max WAND or the block-max conjunction
++/// can walk.
+ pub(crate) enum PrunableInclude {
+     SingleTerm(Box<TermScorer>),
+     TermUnion(Vec<TermScorer>),
++    TermIntersection(Vec<TermScorer>),
+ }
+ 
+ /// The `MustNot` scorers of a boolean query, keeping the concrete `TermScorer`
+@@ -48,11 +50,11 @@ impl ExclusionSet for ExclusionScorers {
+     }
+ }
+ 
+-/// Runs block-max WAND over `include` and passes on to `callback` only the documents
+-/// that are not in `exclusion`.
++/// Runs block-max WAND, or the block-max conjunction for an intersection, over `include` and
++/// passes on to `callback` only the documents that are not in `exclusion`.
+ ///
+ /// The exclusion set cannot change a score, so it is probed last: only for the documents
+-/// that already beat the threshold. Both walkers emit strictly increasing doc ids, which is
++/// that already beat the threshold. All walkers emit strictly increasing doc ids, which is
+ /// the contract `ExclusionSet::contains` relies on. This mirrors how deleted documents are
+ /// filtered in the callback of `SortBySimilarityScore::collect_segment_top_k`.
+ pub(crate) fn for_each_pruning_excluding(
+@@ -76,6 +78,9 @@ pub(crate) fn for_each_pruning_excluding(
+         PrunableInclude::TermUnion(scorers) => {
+             block_wand(scorers, threshold, &mut filtered_callback)
+         }
++        PrunableInclude::TermIntersection(scorers) => {
++            block_max_conjunction(scorers, threshold, &mut filtered_callback)
++        }
+     }
+ }
+ 
+@@ -189,6 +194,18 @@ mod tests {
+                 ],
+                 matches: |words| words.contains("a") && words.contains("c") && !words.contains("b"),
+             },
++            Case {
++                clauses: &[(Occur::Must, "a"), (Occur::Must, "c")],
++                matches: |words| words.contains("a") && words.contains("c"),
++            },
++            Case {
++                clauses: &[(Occur::Must, "a"), (Occur::Must, "b")],
++                matches: |words| words.contains("a") && words.contains("b"),
++            },
++            Case {
++                clauses: &[(Occur::Must, "a"), (Occur::Must, "b"), (Occur::Must, "c")],
++                matches: |words| words.contains("a") && words.contains("b") && words.contains("c"),
++            },
+         ]
+     }
+ 
+diff --git a/src/query/boolean_query/mod.rs b/src/query/boolean_query/mod.rs
+index f2adc0d..d7554ea 100644
+--- a/src/query/boolean_query/mod.rs
++++ b/src/query/boolean_query/mod.rs
+@@ -1,8 +1,10 @@
++mod block_max_conjunction;
+ mod block_wand;
+ mod boolean_query;
+ mod boolean_weight;
+ mod excluding_pruner;
+ 
++pub(crate) use self::block_max_conjunction::block_max_conjunction;
+ pub(crate) use self::block_wand::{block_wand, block_wand_single_scorer};
+ pub use self::boolean_query::BooleanQuery;
+ pub use self::boolean_weight::BooleanWeight;
