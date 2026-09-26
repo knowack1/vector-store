@@ -77,6 +77,10 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
 
+mod bm25_fast_path;
+
+pub(crate) use bm25_fast_path::HttpService;
+
 #[derive(OpenApi)]
 #[openapi(
      info(
@@ -145,7 +149,7 @@ pub(crate) async fn new(
     internals: Sender<Internals>,
     index_engine_version: String,
     use_tls: bool,
-) -> Router {
+) -> HttpService {
     let state = RoutesInnerState(Arc::new(RoutesInner {
         engine,
         indexes,
@@ -159,10 +163,13 @@ pub(crate) async fn new(
     let router = router
         .route("/metrics", get(get_metrics))
         .nest("/api/internals", new_internals())
-        .with_state(state)
+        .with_state(state.clone())
         .layer(TraceLayer::new_for_http());
 
-    router.merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api))
+    HttpService::new(
+        router.merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api)),
+        state,
+    )
 }
 
 pub fn api() -> utoipa::openapi::OpenApi {

@@ -6207,6 +6207,7 @@ dependencies = [
  "time",
  "tokio",
  "tower-http",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "tracing-test",

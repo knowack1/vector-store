@@ -12,6 +12,8 @@ use crate::metrics::Metrics;
 use crate::node_state::NodeState;
 use anyhow::bail;
 use axum::Router;
+use axum::ServiceExt;
+use axum::extract::Request;
 use axum_server::Handle;
 use axum_server::accept::NoDelayAcceptor;
 use axum_server::tls_rustls::RustlsConfig;
@@ -334,7 +336,7 @@ async fn spawn_server(
 
     let handle = Handle::new();
 
-    let router = httproutes::new(
+    let service = httproutes::new(
         Arc::clone(&deps.indexes),
         deps.engine.clone(),
         deps.metrics.clone(),
@@ -344,9 +346,9 @@ async fn spawn_server(
         config.tls.is_some(),
     )
     .await;
+    let router = service.router().clone();
     let mut server_task = tokio::spawn({
         let handle = handle.clone();
-        let router = router.clone();
         let tls = config.tls.clone();
 
         async move {
@@ -356,7 +358,7 @@ async fn spawn_server(
                         RustlsConfig::from_config(Arc::clone(tls_config.server_config()));
                     axum_server::bind_rustls(addr, rustls_config)
                         .handle(handle)
-                        .serve(router.into_make_service())
+                        .serve(ServiceExt::<Request>::into_make_service(service))
                         .await
                 }
                 Some(ref tls_config) => {
@@ -364,14 +366,14 @@ async fn spawn_server(
                         RustlsConfig::from_config(Arc::clone(tls_config.server_config()));
                     axum_server_dual_protocol::bind_dual_protocol(addr, rustls_config)
                         .handle(handle)
-                        .serve(router.into_make_service())
+                        .serve(ServiceExt::<Request>::into_make_service(service))
                         .await
                 }
                 None => {
                     axum_server::bind(addr)
                         .handle(handle)
                         .acceptor(NoDelayAcceptor::new())
-                        .serve(router.into_make_service())
+                        .serve(ServiceExt::<Request>::into_make_service(service))
                         .await
                 }
             };
