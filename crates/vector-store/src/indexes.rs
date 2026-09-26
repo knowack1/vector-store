@@ -16,6 +16,7 @@ use crate::TableName;
 use crate::db_index::DbIndex;
 use crate::db_index::DbIndexExt;
 use crate::fts_index::FtsIndex;
+use crate::fts_index::FtsSearcher;
 use crate::monitor_items::MonitorItems;
 use crate::node_state::IndexStatus;
 use crate::vs_index::VsIndexSearch;
@@ -110,9 +111,17 @@ pub(crate) struct VsIndexData {
     options: crate::IndexOptionsVs,
 }
 
-#[derive(Debug)]
 pub(crate) struct FtsIndexData {
     options: crate::IndexOptionsFts,
+    searcher: FtsSearcher,
+}
+
+impl std::fmt::Debug for FtsIndexData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FtsIndexData")
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<I, D> IndexEntry<I, D> {
@@ -242,6 +251,7 @@ impl FtsIndexEntry {
     pub(crate) async fn new(
         metadata: IndexMetadata,
         index: mpsc::Sender<FtsIndex>,
+        searcher: FtsSearcher,
         monitor: mpsc::Sender<MonitorItems>,
         db_index: mpsc::Sender<DbIndex>,
     ) -> anyhow::Result<Self> {
@@ -256,12 +266,16 @@ impl FtsIndexEntry {
             status: IndexStatus::Initializing,
             progress,
             primary_key_columns: metadata.primary_key_columns,
-            data: FtsIndexData { options },
+            data: FtsIndexData { options, searcher },
         })
     }
 
     pub(crate) fn options(&self) -> &crate::IndexOptionsFts {
         &self.data.options
+    }
+
+    pub(crate) fn searcher(&self) -> &FtsSearcher {
+        &self.data.searcher
     }
 }
 

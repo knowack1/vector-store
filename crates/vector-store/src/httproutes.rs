@@ -1067,13 +1067,16 @@ async fn post_index_bm25(
             return (StatusCode::NOT_FOUND, msg).into_response();
         };
         if entry.status() == crate::node_state::IndexStatus::Serving {
-            Ok((entry.index().clone(), entry.primary_key_columns().clone()))
+            Ok((
+                entry.searcher().clone(),
+                entry.primary_key_columns().clone(),
+            ))
         } else {
             Err(entry.progress())
         }
     };
 
-    let (fts_sender, primary_key_columns) = match check_fts_serving(
+    let (searcher, primary_key_columns) = match check_fts_serving(
         serving_or_progress,
         &state.node_state,
         &keyspace,
@@ -1089,9 +1092,7 @@ async fn post_index_bm25(
         }
     };
 
-    let search_result = fts_sender
-        .search(index_key, request.query, request.limit.into())
-        .await;
+    let search_result = searcher.search(&index_key, &request.query, request.limit.into());
 
     timer.observe_duration();
 

@@ -5,7 +5,6 @@
 
 use crate::AsyncInProgress;
 use crate::IndexKey;
-use crate::Limit;
 use crate::PrimaryKey;
 use crate::table::PrimaryId;
 use crate::vs_index::CountR;
@@ -38,12 +37,6 @@ pub(crate) enum FtsIndex {
         index_key: IndexKey,
         tx: oneshot::Sender<CountR>,
     },
-    Search {
-        index_key: IndexKey,
-        query: String,
-        limit: Limit,
-        tx: oneshot::Sender<FtsSearchR>,
-    },
     Highlight {
         index_key: IndexKey,
         query: String,
@@ -71,7 +64,6 @@ pub(crate) trait FtsIndexExt {
         in_progress: AsyncInProgress,
     ) -> anyhow::Result<()>;
     async fn count(&self, index_key: IndexKey) -> CountR;
-    async fn search(&self, index_key: IndexKey, query: String, limit: Limit) -> FtsSearchR;
     async fn highlight(
         &self,
         index_key: IndexKey,
@@ -114,18 +106,6 @@ impl FtsIndexExt for mpsc::Sender<FtsIndex> {
     async fn count(&self, index_key: IndexKey) -> CountR {
         let (tx, rx) = oneshot::channel();
         self.send(FtsIndex::Count { index_key, tx }).await?;
-        rx.await?
-    }
-
-    async fn search(&self, index_key: IndexKey, query: String, limit: Limit) -> FtsSearchR {
-        let (tx, rx) = oneshot::channel();
-        self.send(FtsIndex::Search {
-            index_key,
-            query,
-            limit,
-            tx,
-        })
-        .await?;
         rx.await?
     }
 

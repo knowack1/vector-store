@@ -328,7 +328,7 @@ async fn add_index_fts(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
     let options = ctx.metadata.fts().ok_or_else(|| {
         anyhow::anyhow!("add_index_fts must be called with a full-text-search index")
     })?;
-    let fts_sender = ctx.index_factories.fts.create_index(
+    let fts = ctx.index_factories.fts.create_index(
         FtsIndexConfiguration {
             key: ctx.key.clone(),
             analyzer: options.analyzer,
@@ -341,14 +341,19 @@ async fn add_index_fts(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
         ctx.key.clone(),
         ctx.table,
         ctx.embeddings_stream,
-        fts_sender.clone(),
+        fts.actor.clone(),
         ctx.metrics,
     )
     .await?;
 
-    let entry =
-        crate::indexes::FtsIndexEntry::new(ctx.metadata, fts_sender, monitor_actor, ctx.db_index)
-            .await?;
+    let entry = crate::indexes::FtsIndexEntry::new(
+        ctx.metadata,
+        fts.actor,
+        fts.searcher,
+        monitor_actor,
+        ctx.db_index,
+    )
+    .await?;
     ctx.indexes.write().unwrap().insert_fts(ctx.key, entry);
     Ok(())
 }

@@ -70,6 +70,8 @@ use crate::Limit;
 use crate::Positions;
 use crate::fts_index::factory::FtsIndexConfiguration;
 use crate::fts_index::factory::FtsIndexFactory;
+use crate::fts_index::factory::FtsIndexHandles;
+use crate::fts_index::factory::FtsSearch;
 use crate::memory::Allocate;
 use crate::memory::Memory;
 use crate::memory::MemoryExt;
@@ -116,7 +118,7 @@ impl FtsIndexFactory for TantivyIndexFactory {
         &self,
         index: FtsIndexConfiguration,
         table: Arc<RwLock<Table>>,
-    ) -> mpsc::Sender<FtsIndex> {
+    ) -> FtsIndexHandles {
         new(
             index,
             table,
@@ -863,21 +865,27 @@ fn handle_stats(state: &IndexState) -> FtsStatsR {
     })
 }
 
+/// The index states of an actor, shared with its searcher.
+///
+/// Only the actor adds states. A state is created on the first write, so a searcher
+/// looks its state up on every search instead of keeping the one it first saw.
+type States = RwLock<BTreeMap<IndexId, Arc<IndexState>>>;
+
 fn get_or_create_state<T: TableSearch>(
-    states: &mut BTreeMap<IndexId, Arc<IndexState>>,
+    states: &States,
     table: &RwLock<T>,
     index: &FtsIndexConfiguration,
     tuning: FtsTuning,
 ) -> Option<Arc<IndexState>> {
     let key = &index.key;
     let index_id = table.read().unwrap().index_id(key)?;
-    if let Some(state) = states.get(&index_id) {
+    if let Some(state) = states.read().unwrap().get(&index_id) {
         return Some(Arc::clone(state));
     }
     match IndexState::new(index.analyzer, index.positions, tuning) {
         Ok(state) => {
             let state = Arc::new(state);
-            states.insert(index_id, Arc::clone(&state));
+            states.write().unwrap().insert(index_id, Arc::clone(&state));
             Some(state)
         }
         Err(err) => {
@@ -888,12 +896,30 @@ fn get_or_create_state<T: TableSearch>(
 }
 
 fn get_state<T: TableSearch>(
-    states: &BTreeMap<IndexId, Arc<IndexState>>,
+    states: &States,
     table: &RwLock<T>,
     key: &IndexKey,
 ) -> Option<Arc<IndexState>> {
     let index_id = table.read().unwrap().index_id(key)?;
-    states.get(&index_id).cloned()
+    states.read().unwrap().get(&index_id).cloned()
+}
+
+/// Runs searches on the calling thread, against the states its actor keeps.
+///
+/// Each search takes the searcher of the latest reader reload, so it sees every commit
+/// and merge reload the actor has finished.
+struct TantivySearcher<T> {
+    states: Arc<States>,
+    table: Arc<RwLock<T>>,
+}
+
+impl<T: TableSearch> FtsSearch for TantivySearcher<T> {
+    fn search(&self, index_key: &IndexKey, query: &str, limit: Limit) -> FtsSearchR {
+        let Some(state) = get_state(&self.states, self.table.as_ref(), index_key) else {
+            return Ok((vec![], vec![]));
+        };
+        handle_search(&state, self.table.as_ref(), index_key, query, limit)
+    }
 }
 
 fn can_allocate_memory(
@@ -921,12 +947,16 @@ pub(crate) fn new(
     commit_interval: Duration,
     commit_threshold: usize,
     tuning: FtsTuning,
-) -> mpsc::Sender<FtsIndex> {
+) -> FtsIndexHandles {
     let (tx, mut rx) = mpsc::channel::<FtsIndex>(perf::channel_size().into());
+    let states: Arc<States> = Arc::default();
+    let searcher = Arc::new(TantivySearcher {
+        states: Arc::clone(&states),
+        table: Arc::clone(&table),
+    });
     tokio::spawn(async move {
         let key = index.key.clone();
         debug!("fts index actor starting for {key}");
-        let mut states: BTreeMap<IndexId, Arc<IndexState>> = BTreeMap::new();
 
         let mut allocate_prev = Allocate::Can;
         let allocate_rx = memory.subscribe_allocate().await;
@@ -947,7 +977,7 @@ pub(crate) fn new(
                             in_progress,
                         } => {
                             let Some(state) = get_or_create_state(
-                                &mut states,
+                                &states,
                                 table.as_ref(),
                                 &index,
                                 tuning,
@@ -977,7 +1007,7 @@ pub(crate) fn new(
                             in_progress,
                         } => {
                             let Some(state) = get_or_create_state(
-                                &mut states,
+                                &states,
                                 table.as_ref(),
                                 &index,
                                 tuning,
@@ -1000,30 +1030,6 @@ pub(crate) fn new(
                                 .map(|s| s.reader.searcher().num_docs() as usize)
                                 .unwrap_or(0);
                             _ = tx.send(Ok(result));
-                        }
-                        FtsIndex::Search {
-                            index_key,
-                            query,
-                            limit,
-                            tx,
-                        } => {
-                            let Some(state) = get_state(&states, table.as_ref(), &index_key) else {
-                                _ = tx.send(Ok((vec![], vec![])));
-                                continue;
-                            };
-                            let table = Arc::clone(&table);
-                            worker
-                                .spawn_blocking(move || {
-                                    let result = handle_search(
-                                        &state,
-                                        table.as_ref(),
-                                        &index_key,
-                                        &query,
-                                        limit,
-                                    );
-                                    _ = tx.send(result);
-                                })
-                                .await;
                         }
                         FtsIndex::Highlight {
                             index_key,
@@ -1072,8 +1078,8 @@ pub(crate) fn new(
                     }
                 }
                 _ = interval.tick() => {
-                    for state in states.values() {
-                        let state = Arc::clone(state);
+                    let current: Vec<_> = states.read().unwrap().values().cloned().collect();
+                    for state in current {
                         let key = key.clone();
                         if state.writer.read().unwrap().has_uncommitted_docs() {
                             worker.spawn_blocking(move || commit(&state, &key)).await;
@@ -1086,7 +1092,10 @@ pub(crate) fn new(
         }
         debug!("fts index actor finished for {key}");
     });
-    tx
+    FtsIndexHandles {
+        actor: tx,
+        searcher,
+    }
 }
 
 #[cfg(test)]
@@ -1151,7 +1160,24 @@ mod tests {
         }
     }
 
-    fn make_sender(table: Arc<RwLock<MockTableSearch>>) -> mpsc::Sender<FtsIndex> {
+    /// An index under test: writes go through its actor, searches through its searcher.
+    struct TestIndex(FtsIndexHandles);
+
+    impl Deref for TestIndex {
+        type Target = mpsc::Sender<FtsIndex>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0.actor
+        }
+    }
+
+    impl TestIndex {
+        async fn search(&self, index_key: IndexKey, query: String, limit: Limit) -> FtsSearchR {
+            self.0.searcher.search(&index_key, &query, limit)
+        }
+    }
+
+    fn make_sender(table: Arc<RwLock<MockTableSearch>>) -> TestIndex {
         make_sender_with_options(table, Analyzer::default(), Positions::default())
     }
 
@@ -1159,7 +1185,7 @@ mod tests {
         table: Arc<RwLock<MockTableSearch>>,
         analyzer: Analyzer,
         positions: Positions,
-    ) -> mpsc::Sender<FtsIndex> {
+    ) -> TestIndex {
         let configuration = FtsIndexConfiguration {
             analyzer,
             positions,
@@ -1172,8 +1198,8 @@ mod tests {
         table: Arc<RwLock<MockTableSearch>>,
         configuration: FtsIndexConfiguration,
         tuning: FtsTuning,
-    ) -> mpsc::Sender<FtsIndex> {
-        new(
+    ) -> TestIndex {
+        TestIndex(new(
             configuration,
             table,
             worker::new(),
@@ -1181,7 +1207,7 @@ mod tests {
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
             tuning,
-        )
+        ))
     }
 
     async fn add_doc(sender: &mpsc::Sender<FtsIndex>, primary: u64, content: &str) {
@@ -1415,7 +1441,8 @@ mod tests {
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
             FtsTuning::default(),
-        );
+        )
+        .actor;
 
         add_doc(&sender, 1, "should not be indexed").await;
 
@@ -1438,7 +1465,8 @@ mod tests {
             Duration::from_secs(3600),
             TEST_COMMIT_THRESHOLD,
             FtsTuning::default(),
-        );
+        )
+        .actor;
         let (tx, mut rx) = mpsc::channel(1);
 
         for primary in 1..=TEST_COMMIT_THRESHOLD as u64 {
@@ -1625,9 +1653,7 @@ mod tests {
         }
     }
 
-    async fn sender_with_committed_segments(
-        target_segments: Option<NonZeroUsize>,
-    ) -> mpsc::Sender<FtsIndex> {
+    async fn sender_with_committed_segments(target_segments: Option<NonZeroUsize>) -> TestIndex {
         let sender = make_sender_with_tuning(
             make_table_with_keys(),
             make_configuration(),
@@ -1673,6 +1699,115 @@ mod tests {
             segment_count(&sender).await as u64,
             CONSOLIDATION_TEST_SEGMENTS
         );
+    }
+
+    fn search_limit(limit: usize) -> Limit {
+        Limit::from(NonZeroUsize::new(limit).unwrap())
+    }
+
+    fn sorted_ids(keys: Vec<PrimaryKey>) -> Vec<PrimaryKey> {
+        let mut keys = keys;
+        keys.sort_by_key(|key| format!("{key:?}"));
+        keys
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn searcher_taken_before_any_write_sees_later_commits() {
+        let index = make_sender(make_table_with_keys());
+        let searcher = Arc::clone(&index.0.searcher);
+        let key = make_index_key();
+
+        let (before, _) = searcher.search(&key, "fox", search_limit(10)).unwrap();
+        add_doc(&index, 1, "the quick brown fox").await;
+        let (after_first, _) = searcher.search(&key, "fox", search_limit(10)).unwrap();
+        add_doc(&index, 2, "a fox again").await;
+        let (after_second, _) = searcher.search(&key, "fox", search_limit(10)).unwrap();
+        rm_doc(&index, 1).await;
+        let (after_removal, _) = searcher.search(&key, "fox", search_limit(10)).unwrap();
+
+        assert!(before.is_empty());
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_second.len(), 2);
+        assert_eq!(after_removal.len(), 1);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn searcher_keeps_every_document_across_the_reloads_of_consolidation() {
+        let index = sender_with_committed_segments(Some(CONSOLIDATION_TEST_TARGET)).await;
+        let searcher = Arc::clone(&index.0.searcher);
+        let key = make_index_key();
+        let docs = CONSOLIDATION_TEST_SEGMENTS as usize * TEST_COMMIT_THRESHOLD;
+        let (before, _) = searcher.search(&key, "body", search_limit(100)).unwrap();
+
+        index.consolidate(make_index_key()).await.unwrap();
+        let deadline = tokio::time::Instant::now() + MERGE_SETTLE_TIMEOUT;
+        while segment_count(&index).await > CONSOLIDATION_TEST_TARGET.get() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(TEST_COMMIT_INTERVAL).await;
+        }
+        let (after, _) = searcher.search(&key, "body", search_limit(100)).unwrap();
+
+        assert_eq!(before.len(), docs);
+        assert_eq!(sorted_ids(after), sorted_ids(before));
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn searcher_does_not_see_documents_rejected_for_memory() {
+        let table = make_table_with_keys();
+        let handles = new(
+            make_configuration(),
+            table,
+            worker::new(),
+            make_memory_actor_cannot_allocate(),
+            TEST_COMMIT_INTERVAL,
+            TEST_COMMIT_THRESHOLD,
+            FtsTuning::default(),
+        );
+
+        add_doc(&handles.actor, 1, "should not be indexed").await;
+        let (keys, _) = handles
+            .searcher
+            .search(&make_index_key(), "indexed", search_limit(10))
+            .unwrap();
+
+        assert!(keys.is_empty());
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn searcher_answers_while_the_actor_is_blocked() {
+        let (stalled_worker, _never_run) = async_channel::bounded(1);
+        let handles = new(
+            make_configuration(),
+            make_table_with_keys(),
+            stalled_worker,
+            make_memory_actor(),
+            TEST_COMMIT_INTERVAL,
+            TEST_COMMIT_THRESHOLD,
+            FtsTuning::default(),
+        );
+        for primary in 1..=3 {
+            let (tx, _rx) = mpsc::channel(1);
+            handles
+                .actor
+                .add_document(primary.into(), "fox".into(), AsyncInProgress::Fullscan(tx))
+                .await
+                .unwrap();
+        }
+
+        let (keys, _) = handles
+            .searcher
+            .search(&make_index_key(), "fox", search_limit(10))
+            .unwrap();
+
+        assert!(keys.is_empty());
     }
 
     fn state_with_committed_segments() -> Arc<IndexState> {
