@@ -1,0 +1,80 @@
+# Let a caller move past a posting-list block without decoding it
+# Base: tantivy 0.26.1 (crates.io) plus tantivy-0.26.1-phrase-pruning.patch plus
+# tantivy-0.26.1-bool-not-pruning.patch
+# Adds BlockSegmentPostings::shallow_advance (advance() without its load_block()) and makes
+# BlockSegmentPostings::load_block public; advance() now calls the two, with unchanged behaviour.
+# Adds a test that shallow_advance() plus load_block() reaches the blocks advance() does.
+# Apply after the other two with: git apply -p1 tantivy-0.26.1-block-shallow-advance.patch
+--- a/src/postings/block_segment_postings.rs
++++ b/src/postings/block_segment_postings.rs
+@@ -302,7 +302,11 @@ impl BlockSegmentPostings {
+         self.block_loaded
+     }
+ 
+-    pub(crate) fn load_block(&mut self) {
++    /// Decodes the current block's doc ids and term frequencies, unless it is already
++    /// decoded.
++    ///
++    /// Needed after `.shallow_advance()` before the block's docs or freqs are read.
++    pub fn load_block(&mut self) {
+         if self.block_is_loaded() {
+             return;
+         }
+@@ -354,10 +358,19 @@ impl BlockSegmentPostings {
+ 
+     /// Advance to the next block.
+     pub fn advance(&mut self) {
++        self.shallow_advance();
++        self.load_block();
++    }
++
++    /// Advance to the next block without decoding it.
++    ///
++    /// `.block_max_score(..)` reads the new block's maximum from the skip list, so a
++    /// caller can reject the block without paying for its decoding. `.load_block()` has
++    /// to be called before its docs or freqs are read.
++    pub fn shallow_advance(&mut self) {
+         self.skip_reader.advance();
+         self.block_loaded = false;
+         self.block_max_score_cache = None;
+-        self.load_block();
+     }
+ 
+     /// Returns an empty segment postings object
+@@ -479,6 +492,36 @@ mod tests {
+         Ok(())
+     }
+ 
++    fn assert_shallow_advance_reaches_the_blocks_advance_does(docs: &[DocId]) -> crate::Result<()> {
++        let mut decoded = build_block_postings(docs)?;
++        let mut shallow = build_block_postings(docs)?;
++        let mut block = 0;
++        loop {
++            if block % 2 == 1 {
++                assert!(!shallow.block_is_loaded());
++                shallow.load_block();
++                assert_eq!(shallow.docs(), decoded.docs(), "block {block}");
++            }
++            if decoded.docs().is_empty() {
++                break;
++            }
++            decoded.advance();
++            shallow.shallow_advance();
++            block += 1;
++        }
++        shallow.load_block();
++        assert!(shallow.docs().is_empty());
++        Ok(())
++    }
++
++    #[test]
++    fn test_shallow_advance_reaches_the_blocks_advance_does() -> crate::Result<()> {
++        let partial_last_block = (0..1000).map(|doc| doc * 3).collect::<Vec<u32>>();
++        assert_shallow_advance_reaches_the_blocks_advance_does(&partial_last_block)?;
++        let empty_last_block = (0..2 * COMPRESSION_BLOCK_SIZE as u32).collect::<Vec<u32>>();
++        assert_shallow_advance_reaches_the_blocks_advance_does(&empty_last_block)
++    }
++
+     fn build_block_postings(docs: &[DocId]) -> crate::Result<BlockSegmentPostings> {
+         let mut schema_builder = Schema::builder();
+         let int_field = schema_builder.add_u64_field("id", INDEXED);
