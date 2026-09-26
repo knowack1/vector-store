@@ -7,9 +7,10 @@
 //!
 //! `QueryParser::parse_query` runs a nom grammar over the query text before it tokenizes
 //! the literals it found. For a one-word query the grammar is two thirds of the parse.
-//! A query made only of ASCII letters and digits, other than the grammar's operator
-//! words, can only parse to one literal of the default field, so it is tokenized the way
-//! the parser tokenizes that literal, and turned into the query the parser would build.
+//! A query made only of letters and digits (Unicode alphanumerics), other than the
+//! grammar's operator words, can only parse to one literal of the default field: the
+//! grammar ends a word only at whitespace or at ASCII punctuation. So it is tokenized the
+//! way the parser tokenizes that literal, and turned into the query the parser would build.
 
 use tantivy::Index;
 use tantivy::Term;
@@ -42,9 +43,7 @@ pub(super) fn parse(index: &Index, field: Field, query: &str) -> Option<Box<dyn 
 }
 
 fn is_bare_word(query: &str) -> bool {
-    !query.is_empty()
-        && query.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        && !OPERATORS.contains(&query)
+    !query.is_empty() && query.chars().all(char::is_alphanumeric) && !OPERATORS.contains(&query)
 }
 
 fn is_indexed_text(index: &Index, field: Field) -> bool {
@@ -91,8 +90,8 @@ mod tests {
     ];
 
     /// Bare words: plain, mixed case, stop words of several languages, words the stemmers
-    /// change, digits, and operator words in lower case.
-    const BARE_WORDS: [&str; 21] = [
+    /// change, digits, operator words in lower case, and words outside ASCII.
+    const BARE_WORDS: [&str; 30] = [
         "mocatta",
         "Mocatta",
         "MOCATTA",
@@ -114,10 +113,19 @@ mod tests {
         "to",
         "a",
         "I",
+        "été",
+        "naïve",
+        "Häuser",
+        "tarım",
+        "İstanbul",
+        "евский",
+        "Москва",
+        "東京",
+        "٣٤",
     ];
 
     /// Queries the grammar may read as something other than one literal.
-    const NOT_BARE_WORDS: [&str; 27] = [
+    const NOT_BARE_WORDS: [&str; 28] = [
         "",
         " mocatta",
         "mocatta ",
@@ -135,9 +143,10 @@ mod tests {
         "mocatta-pasha",
         "mocatta_pasha",
         "mocatta.pasha",
-        "été",
-        "naïve",
-        "Häuser",
+        "e\u{301}te",
+        "mocatta\u{a0}",
+        "mocatta\u{200b}",
+        "«mocatta»",
         "AND",
         "OR",
         "NOT",
@@ -200,8 +209,11 @@ mod tests {
     }
 
     #[test]
-    fn random_ascii_words_build_the_query_the_parser_builds() {
-        const ALPHABET: &[u8] = b"abcXYZ019ANDORINT";
+    fn random_words_build_the_query_the_parser_builds() {
+        const ALPHABET: [char; 22] = [
+            'a', 'b', 'c', 'X', 'Y', 'Z', '0', '1', '9', 'A', 'N', 'D', 'O', 'R', 'I', 'T', 'é',
+            'ı', 'İ', 'Ж', '東', '٣',
+        ];
         let (index, field) = index_with(Analyzer::Standard);
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
         for _ in 0..2000 {
@@ -210,7 +222,7 @@ mod tests {
             state ^= state << 17;
             let len = 1 + (state % 5) as usize;
             let word: String = (0..len)
-                .map(|i| ALPHABET[((state >> (8 * i)) % ALPHABET.len() as u64) as usize] as char)
+                .map(|i| ALPHABET[((state >> (8 * i)) % ALPHABET.len() as u64) as usize])
                 .collect();
             let fast = parse(&index, field, &word);
             if fast.is_some() {
@@ -235,6 +247,7 @@ mod tests {
             "a runner ran",
             "dogs and cats, running",
             "nothing here",
+            "Häuser in İstanbul",
         ] {
             let mut doc = TantivyDocument::new();
             doc.add_text(field, body);
@@ -247,7 +260,9 @@ mod tests {
                 .search(query.as_ref(), &TopDocs::with_limit(10).order_by_score())
                 .unwrap()
         };
-        for word in ["running", "Dogs", "the", "cats", "absent"] {
+        for word in [
+            "running", "Dogs", "the", "cats", "absent", "HÄUSER", "istanbul",
+        ] {
             let fast = top(parse(&index, field, word).unwrap());
             assert_eq!(
                 fast,
