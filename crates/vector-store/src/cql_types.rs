@@ -140,6 +140,30 @@ fn serialize_uuid<S: serde::Serializer>(value: &Uuid, serializer: S) -> Result<S
     serializer.serialize_str(value.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
 }
 
+/// Appends the JSON of [`JsonCqlValue`] to `out`.
+///
+/// A hyphenated UUID holds no character JSON escapes, so it is copied in whole instead
+/// of going through serde_json's per-byte escape scan.
+pub(crate) fn write_json(out: &mut Vec<u8>, value: &CqlValue) -> serde_json::Result<()> {
+    match value {
+        CqlValue::Uuid(value) => write_json_uuid(out, value),
+        CqlValue::Timeuuid(value) => write_json_uuid(out, value.as_ref()),
+        value => serde_json::to_writer(out, &JsonCqlValue(value))?,
+    }
+    Ok(())
+}
+
+fn write_json_uuid(out: &mut Vec<u8>, value: &Uuid) {
+    out.push(b'"');
+    out.extend_from_slice(
+        value
+            .hyphenated()
+            .encode_lower(&mut Uuid::encode_buffer())
+            .as_bytes(),
+    );
+    out.push(b'"');
+}
+
 pub(crate) fn from_json(value: Value, cql_type: &NativeType) -> anyhow::Result<CqlValue> {
     match value {
         Value::String(value) => match cql_type {
@@ -479,6 +503,17 @@ mod tests {
             serde_json::to_string(&via_value).unwrap(),
             "{value:?}: serialized text"
         );
+        assert_eq!(
+            String::from_utf8(written_json(&value).unwrap()).unwrap(),
+            serde_json::to_string(&via_value).unwrap(),
+            "{value:?}: write_json text"
+        );
+    }
+
+    fn written_json(value: &CqlValue) -> serde_json::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        write_json(&mut out, value)?;
+        Ok(out)
     }
 
     #[test]
@@ -507,6 +542,27 @@ mod tests {
     fn json_cql_value_fails_where_to_json_fails() {
         assert!(to_json(CqlValue::Empty).is_err());
         assert!(serde_json::to_value(JsonCqlValue(&CqlValue::Empty)).is_err());
+    }
+
+    #[test]
+    fn write_json_fails_with_the_serializer_error() {
+        assert_eq!(
+            written_json(&CqlValue::Empty).unwrap_err().to_string(),
+            serde_json::to_string(&JsonCqlValue(&CqlValue::Empty))
+                .unwrap_err()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn write_json_appends_to_what_the_buffer_holds() {
+        let mut out = b"prefix,".to_vec();
+        write_json(&mut out, &CqlValue::Uuid(Uuid::from_u128(1))).unwrap();
+        write_json(&mut out, &CqlValue::BigInt(-7)).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"prefix,"00000000-0000-0000-0000-000000000001"-7"#
+        );
     }
 
     #[test]

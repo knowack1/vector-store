@@ -1145,7 +1145,7 @@ async fn bm25(
                     debug!("post_index_bm25: {err}");
                     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
                 }
-                Ok(()) => (StatusCode::OK, response::Json(body)).into_response(),
+                Ok(()) => body.into_response(),
             }
         }
     }
@@ -1456,7 +1456,7 @@ fn check_insecure_tls(
     None
 }
 
-/// Serializes to the same JSON as [`httpapi::PostIndexBm25Response`] built with
+/// Writes the same JSON as [`httpapi::PostIndexBm25Response`] built with
 /// [`try_collect_primary_keys`], writing the primary keys straight into the response
 /// instead of first building a map of `serde_json::Value` trees.
 struct Bm25ResponseBody<'a> {
@@ -1465,12 +1465,13 @@ struct Bm25ResponseBody<'a> {
     scores: &'a [f32],
 }
 
-struct PrimaryKeyColumns<'a>(&'a Bm25ResponseBody<'a>);
-
-struct PrimaryKeyColumn<'a> {
-    idx_column: usize,
-    primary_keys: &'a [crate::PrimaryKey],
-}
+/// Room for one quoted, hyphenated UUID and the comma after it.
+const JSON_BYTES_PER_KEY_VALUE: usize = 40;
+/// Room for one `f32` score and the comma after it.
+const JSON_BYTES_PER_SCORE: usize = 16;
+/// Room for the object's fixed keys and brackets, and for each column name's.
+const JSON_BYTES_FIXED: usize = 32;
+const JSON_BYTES_PER_COLUMN: usize = 6;
 
 impl Bm25ResponseBody<'_> {
     fn check_primary_key_sizes(&self) -> anyhow::Result<()> {
@@ -1480,46 +1481,67 @@ impl Bm25ResponseBody<'_> {
             None => Ok(()),
         }
     }
-}
 
-impl serde::Serialize for Bm25ResponseBody<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(2))?;
-        map.serialize_entry("primary_keys", &PrimaryKeyColumns(self))?;
-        map.serialize_entry("scores", self.scores)?;
-        map.end()
-    }
-}
-
-impl serde::Serialize for PrimaryKeyColumns<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let columns = self.0.primary_key_columns;
-        let mut map = serializer.serialize_map(Some(columns.len()))?;
-        for (idx_column, column) in columns.iter().enumerate() {
-            let column: &str = column.as_ref();
-            let values = PrimaryKeyColumn {
-                idx_column,
-                primary_keys: self.0.primary_keys,
-            };
-            map.serialize_entry(column, &values)?;
+    /// The JSON body, written into a buffer sized from the hit count.
+    fn to_json(&self) -> serde_json::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.json_size_hint());
+        out.extend_from_slice(br#"{"primary_keys":{"#);
+        for (idx_column, column) in self.primary_key_columns.iter().enumerate() {
+            if idx_column > 0 {
+                out.push(b',');
+            }
+            self.write_primary_key_column(&mut out, idx_column, column.as_ref())?;
         }
-        map.end()
+        out.extend_from_slice(br#"},"scores":"#);
+        serde_json::to_writer(&mut out, self.scores)?;
+        out.push(b'}');
+        Ok(out)
     }
-}
 
-impl serde::Serialize for PrimaryKeyColumn<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq;
-        let mut seq = serializer.serialize_seq(Some(self.primary_keys.len()))?;
-        for primary_key in self.primary_keys {
-            let value = primary_key.get(self.idx_column).ok_or_else(|| {
+    fn write_primary_key_column(
+        &self,
+        out: &mut Vec<u8>,
+        idx_column: usize,
+        column: &str,
+    ) -> serde_json::Result<()> {
+        serde_json::to_writer(&mut *out, column)?;
+        out.extend_from_slice(b":[");
+        for (idx_key, primary_key) in self.primary_keys.iter().enumerate() {
+            if idx_key > 0 {
+                out.push(b',');
+            }
+            let value = primary_key.get(idx_column).ok_or_else(|| {
                 serde::ser::Error::custom("primary key index out of bounds after length check")
             })?;
-            seq.serialize_element(&cql_types::JsonCqlValue(&value))?;
+            cql_types::write_json(out, &value)?;
         }
-        seq.end()
+        out.push(b']');
+        Ok(())
+    }
+
+    fn json_size_hint(&self) -> usize {
+        let columns: usize = self
+            .primary_key_columns
+            .iter()
+            .map(|column| AsRef::<str>::as_ref(column).len() + JSON_BYTES_PER_COLUMN)
+            .sum();
+        let per_hit =
+            self.primary_key_columns.len() * JSON_BYTES_PER_KEY_VALUE + JSON_BYTES_PER_SCORE;
+        JSON_BYTES_FIXED + columns + self.primary_keys.len() * per_hit
+    }
+
+    fn into_response(self) -> Response {
+        match self.to_json() {
+            Ok(json) => (
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                )],
+                axum::body::Bytes::from(json),
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        }
     }
 }
 
@@ -1702,9 +1724,12 @@ mod tests {
 
         body.check_primary_key_sizes().unwrap();
         assert_eq!(
-            serde_json::to_value(&body).unwrap(),
-            serde_json::to_value(bm25_response_via_value(&columns, &primary_keys, &scores))
-                .unwrap()
+            serde_json::from_slice::<Value>(&body.to_json().unwrap()).unwrap(),
+            serde_json::from_slice::<Value>(
+                &serde_json::to_vec(&bm25_response_via_value(&columns, &primary_keys, &scores))
+                    .unwrap()
+            )
+            .unwrap()
         );
     }
 
@@ -1726,7 +1751,7 @@ mod tests {
         };
 
         assert_eq!(
-            serde_json::to_string(&body).unwrap(),
+            String::from_utf8(body.to_json().unwrap()).unwrap(),
             serde_json::to_string(&bm25_response_via_value(&columns, &primary_keys, &scores))
                 .unwrap()
         );
@@ -1742,8 +1767,113 @@ mod tests {
         };
 
         assert_eq!(
-            serde_json::to_string(&body).unwrap(),
+            String::from_utf8(body.to_json().unwrap()).unwrap(),
             r#"{"primary_keys":{"article_id":[]},"scores":[]}"#
+        );
+    }
+
+    #[test]
+    fn bm25_response_body_writes_columns_in_order_as_serde_would() {
+        let columns: Vec<crate::ColumnName> = vec!["id".into(), "ti\"tle".into(), "ts".into()];
+        let primary_keys = sample_primary_keys();
+        let scores = [19.250362, f32::NAN, 1e-7];
+        let body = Bm25ResponseBody {
+            primary_key_columns: &columns,
+            primary_keys: &primary_keys,
+            scores: &scores,
+        };
+
+        let column = |(idx, name): (usize, &crate::ColumnName)| {
+            let values: Vec<Value> = primary_keys
+                .iter()
+                .map(|key| cql_types::to_json(key.get(idx).unwrap()).unwrap())
+                .collect();
+            let name = serde_json::to_string(AsRef::<str>::as_ref(name)).unwrap();
+            format!("{name}:{}", serde_json::to_string(&values).unwrap())
+        };
+        let expected = format!(
+            r#"{{"primary_keys":{{{}}},"scores":{}}}"#,
+            columns.iter().enumerate().map(column).join(","),
+            serde_json::to_string(&scores).unwrap()
+        );
+        assert_eq!(
+            String::from_utf8(body.to_json().unwrap()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn bm25_response_body_size_hint_covers_a_uuid_key() {
+        let columns: Vec<crate::ColumnName> = vec!["article_id".into()];
+        let primary_keys: Vec<crate::PrimaryKey> = (0..10)
+            .map(|i| {
+                [CqlValue::Uuid(uuid::Uuid::from_u128(u128::MAX - i))]
+                    .into_iter()
+                    .collect()
+            })
+            .collect();
+        let scores = [-123.456_79_f32; 10];
+        let body = Bm25ResponseBody {
+            primary_key_columns: &columns,
+            primary_keys: &primary_keys,
+            scores: &scores,
+        };
+
+        assert!(body.to_json().unwrap().len() <= body.json_size_hint());
+    }
+
+    #[test]
+    fn bm25_response_body_fails_on_a_value_without_json() {
+        let columns: Vec<crate::ColumnName> = vec!["id".into()];
+        let primary_keys: Vec<crate::PrimaryKey> = vec![[CqlValue::Empty].into_iter().collect()];
+        let body = Bm25ResponseBody {
+            primary_key_columns: &columns,
+            primary_keys: &primary_keys,
+            scores: &[1.0],
+        };
+
+        assert_eq!(
+            body.to_json().unwrap_err().to_string(),
+            serde_json::to_string(&cql_types::JsonCqlValue(&CqlValue::Empty))
+                .unwrap_err()
+                .to_string()
+        );
+        assert_eq!(
+            body.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn bm25_response_body_responds_as_axum_json_does() {
+        let columns: Vec<crate::ColumnName> = vec!["article_id".into()];
+        let primary_keys: Vec<crate::PrimaryKey> = (0..5)
+            .map(|i| {
+                [CqlValue::Uuid(uuid::Uuid::from_u128(i))]
+                    .into_iter()
+                    .collect()
+            })
+            .collect();
+        let scores = [19.250362, 16.006615, 15.500248, 14.362967, 13.068089];
+        let body = Bm25ResponseBody {
+            primary_key_columns: &columns,
+            primary_keys: &primary_keys,
+            scores: &scores,
+        };
+        let expected = response::Json(bm25_response_via_value(&columns, &primary_keys, &scores))
+            .into_response();
+
+        let got = body.into_response();
+
+        assert_eq!(got.status(), expected.status());
+        assert_eq!(got.headers(), expected.headers());
+        assert_eq!(
+            axum::body::to_bytes(got.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            axum::body::to_bytes(expected.into_body(), usize::MAX)
+                .await
+                .unwrap()
         );
     }
 
