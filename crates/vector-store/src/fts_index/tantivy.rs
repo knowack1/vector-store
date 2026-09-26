@@ -86,6 +86,7 @@ use super::actor::FtsIndex;
 use super::actor::FtsSearchR;
 use super::actor::FtsStats;
 use super::actor::FtsStatsR;
+use super::bare_word;
 use super::consolidation;
 use super::term_top_k;
 
@@ -226,7 +227,7 @@ fn stop_words(language: Language) -> anyhow::Result<StopWordFilter> {
 
 /// The same token pipeline runs over the indexed documents and over the queries,
 /// so both sides produce matching tokens.
-fn build_token_pipeline(analyzer: Analyzer) -> anyhow::Result<TextAnalyzer> {
+pub(super) fn build_token_pipeline(analyzer: Analyzer) -> anyhow::Result<TextAnalyzer> {
     // The language analyzers share the pipeline of `standard` and add the stop
     // words and the stemming of their own language.
     let language = match analyzer {
@@ -276,7 +277,7 @@ fn body_text_options(tokenizer: &str, positions: Positions) -> TextOptions {
     TextOptions::default().set_indexing_options(indexing)
 }
 
-fn build_schema(tokenizer: &str, positions: Positions) -> Schema {
+pub(super) fn build_schema(tokenizer: &str, positions: Positions) -> Schema {
     let mut schema_builder = Schema::builder();
     // INDEXED serves the delete-by-term of removals, FAST the hit-to-id lookup of searches.
     schema_builder.add_u64_field("primary_id", INDEXED | FAST);
@@ -533,6 +534,9 @@ fn make_query(
     body_field: tantivy::schema::Field,
     query_str: &str,
 ) -> anyhow::Result<Box<dyn tantivy::query::Query>> {
+    if let Some(query) = bare_word::parse(index, body_field, query_str) {
+        return Ok(query);
+    }
     let query_parser = QueryParser::for_index(index, vec![body_field]);
     query_parser
         .parse_query(query_str)

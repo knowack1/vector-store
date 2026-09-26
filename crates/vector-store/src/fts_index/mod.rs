@@ -4,6 +4,7 @@
  */
 
 mod actor;
+mod bare_word;
 mod consolidation;
 mod factory;
 mod tantivy;
