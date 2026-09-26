@@ -1403,6 +1403,75 @@ mod tests {
         assert_eq!(scores.len(), 1);
     }
 
+    const NOT_QUERY_DOCS: u64 = 24;
+    const NOT_QUERY_LIMITS: [usize; 4] = [1, 3, 10, 100];
+
+    fn contains_excluded_word(id: u64) -> bool {
+        id % 3 == 0
+    }
+
+    /// Every document holds the include word; a distinct length keeps the BM25 scores apart.
+    fn not_query_doc(id: u64) -> String {
+        let include = vec!["alpha"; 1 + (id % 4) as usize];
+        let exclude = if contains_excluded_word(id) {
+            vec!["beta"]
+        } else {
+            vec![]
+        };
+        let filler = vec!["filler"; id as usize];
+        [include, exclude, filler].concat().join(" ")
+    }
+
+    fn test_primary_key(id: u64) -> PrimaryKey {
+        PrimaryKey::from(vec![CqlValue::BigInt(id as i64)])
+    }
+
+    fn assert_nearly_equal_scores(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() <= 1e-5 * expected.abs());
+        }
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn not_query_returns_the_include_ranking_without_excluded_docs() {
+        let index = make_sender(make_table_with_keys());
+        for id in 0..NOT_QUERY_DOCS {
+            add_doc(&index, id, &not_query_doc(id)).await;
+        }
+        let key = make_index_key();
+        let excluded: Vec<PrimaryKey> = (0..NOT_QUERY_DOCS)
+            .filter(|&id| contains_excluded_word(id))
+            .map(test_primary_key)
+            .collect();
+
+        let (include_keys, include_scores) = index
+            .search(key.clone(), "alpha".into(), search_limit(100))
+            .await
+            .unwrap();
+        let (surviving_keys, surviving_scores): (Vec<PrimaryKey>, Vec<f32>) = include_keys
+            .into_iter()
+            .zip(include_scores)
+            .filter(|(primary_key, _)| !excluded.contains(primary_key))
+            .unzip();
+
+        assert_eq!(
+            surviving_keys.len() + excluded.len(),
+            NOT_QUERY_DOCS as usize
+        );
+        for limit in NOT_QUERY_LIMITS {
+            let (keys, scores) = index
+                .search(key.clone(), "alpha NOT beta".into(), search_limit(limit))
+                .await
+                .unwrap();
+            let expected_len = limit.min(surviving_keys.len());
+            assert_eq!(keys, surviving_keys[..expected_len], "limit {limit}");
+            assert_nearly_equal_scores(&scores, &surviving_scores[..expected_len]);
+        }
+    }
+
     #[rstest]
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
