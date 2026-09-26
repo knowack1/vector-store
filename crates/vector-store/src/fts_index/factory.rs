@@ -28,10 +28,19 @@ pub(crate) trait FtsSearch {
     fn search(&self, index_key: &IndexKey, query: &str, limit: Limit) -> FtsSearchR;
 }
 
+pub(crate) type FtsSearcher = Arc<dyn FtsSearch + Send + Sync>;
+
+/// The two ways into an index: its searcher runs searches, its actor takes everything else
+/// (writes, commits, reloads, counts, highlights and stats).
+pub(crate) struct FtsIndexHandles {
+    pub(crate) actor: mpsc::Sender<FtsIndex>,
+    pub(crate) searcher: FtsSearcher,
+}
+
 pub(crate) trait FtsIndexFactory {
     fn create_index(
         &self,
         index: FtsIndexConfiguration,
         table: Arc<RwLock<Table>>,
-    ) -> mpsc::Sender<FtsIndex>;
+    ) -> FtsIndexHandles;
 }

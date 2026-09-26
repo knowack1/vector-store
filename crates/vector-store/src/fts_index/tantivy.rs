@@ -70,6 +70,7 @@ use crate::Limit;
 use crate::Positions;
 use crate::fts_index::factory::FtsIndexConfiguration;
 use crate::fts_index::factory::FtsIndexFactory;
+use crate::fts_index::factory::FtsIndexHandles;
 use crate::fts_index::factory::FtsSearch;
 use crate::memory::Allocate;
 use crate::memory::Memory;
@@ -116,7 +117,7 @@ impl FtsIndexFactory for TantivyIndexFactory {
         &self,
         index: FtsIndexConfiguration,
         table: Arc<RwLock<Table>>,
-    ) -> mpsc::Sender<FtsIndex> {
+    ) -> FtsIndexHandles {
         new(
             index,
             table,
@@ -871,7 +872,7 @@ pub(crate) fn new(
     commit_interval: Duration,
     commit_threshold: usize,
     tuning: FtsTuning,
-) -> mpsc::Sender<FtsIndex> {
+) -> FtsIndexHandles {
     let (tx, mut rx) = mpsc::channel::<FtsIndex>(perf::channel_size().into());
     let states: Arc<States> = Arc::default();
     let searcher = Arc::new(TantivySearcher {
@@ -955,19 +956,6 @@ pub(crate) fn new(
                                 .unwrap_or(0);
                             _ = tx.send(Ok(result));
                         }
-                        FtsIndex::Search {
-                            index_key,
-                            query,
-                            limit,
-                            tx,
-                        } => {
-                            let searcher = Arc::clone(&searcher);
-                            worker
-                                .spawn_blocking(move || {
-                                    _ = tx.send(searcher.search(&index_key, &query, limit));
-                                })
-                                .await;
-                        }
                         FtsIndex::Highlight {
                             index_key,
                             query,
@@ -1029,7 +1017,10 @@ pub(crate) fn new(
         }
         debug!("fts index actor finished for {key}");
     });
-    tx
+    FtsIndexHandles {
+        actor: tx,
+        searcher,
+    }
 }
 
 #[cfg(test)]
@@ -1094,7 +1085,24 @@ mod tests {
         }
     }
 
-    fn make_sender(table: Arc<RwLock<MockTableSearch>>) -> mpsc::Sender<FtsIndex> {
+    /// An index under test: writes go through its actor, searches through its searcher.
+    struct TestIndex(FtsIndexHandles);
+
+    impl Deref for TestIndex {
+        type Target = mpsc::Sender<FtsIndex>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0.actor
+        }
+    }
+
+    impl TestIndex {
+        async fn search(&self, index_key: IndexKey, query: String, limit: Limit) -> FtsSearchR {
+            self.0.searcher.search(&index_key, &query, limit)
+        }
+    }
+
+    fn make_sender(table: Arc<RwLock<MockTableSearch>>) -> TestIndex {
         make_sender_with_options(table, Analyzer::default(), Positions::default())
     }
 
@@ -1102,7 +1110,7 @@ mod tests {
         table: Arc<RwLock<MockTableSearch>>,
         analyzer: Analyzer,
         positions: Positions,
-    ) -> mpsc::Sender<FtsIndex> {
+    ) -> TestIndex {
         let configuration = FtsIndexConfiguration {
             analyzer,
             positions,
@@ -1115,8 +1123,8 @@ mod tests {
         table: Arc<RwLock<MockTableSearch>>,
         configuration: FtsIndexConfiguration,
         tuning: FtsTuning,
-    ) -> mpsc::Sender<FtsIndex> {
-        new(
+    ) -> TestIndex {
+        TestIndex(new(
             configuration,
             table,
             worker::new(),
@@ -1124,7 +1132,7 @@ mod tests {
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
             tuning,
-        )
+        ))
     }
 
     async fn add_doc(sender: &mpsc::Sender<FtsIndex>, primary: u64, content: &str) {
@@ -1358,7 +1366,8 @@ mod tests {
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
             FtsTuning::default(),
-        );
+        )
+        .actor;
 
         add_doc(&sender, 1, "should not be indexed").await;
 
@@ -1381,7 +1390,8 @@ mod tests {
             Duration::from_secs(3600),
             TEST_COMMIT_THRESHOLD,
             FtsTuning::default(),
-        );
+        )
+        .actor;
         let (tx, mut rx) = mpsc::channel(1);
 
         for primary in 1..=TEST_COMMIT_THRESHOLD as u64 {
@@ -1568,9 +1578,7 @@ mod tests {
         }
     }
 
-    async fn sender_with_committed_segments(
-        target_segments: Option<NonZeroUsize>,
-    ) -> mpsc::Sender<FtsIndex> {
+    async fn sender_with_committed_segments(target_segments: Option<NonZeroUsize>) -> TestIndex {
         let sender = make_sender_with_tuning(
             make_table_with_keys(),
             make_configuration(),
@@ -1616,6 +1624,115 @@ mod tests {
             segment_count(&sender).await as u64,
             CONSOLIDATION_TEST_SEGMENTS
         );
+    }
+
+    fn search_limit(limit: usize) -> Limit {
+        Limit::from(NonZeroUsize::new(limit).unwrap())
+    }
+
+    fn sorted_ids(keys: Vec<PrimaryKey>) -> Vec<PrimaryKey> {
+        let mut keys = keys;
+        keys.sort_by_key(|key| format!("{key:?}"));
+        keys
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn searcher_taken_before_any_write_sees_later_commits() {
+        let index = make_sender(make_table_with_keys());
+        let searcher = Arc::clone(&index.0.searcher);
+        let key = make_index_key();
+
+        let (before, _) = searcher.search(&key, "fox", search_limit(10)).unwrap();
+        add_doc(&index, 1, "the quick brown fox").await;
+        let (after_first, _) = searcher.search(&key, "fox", search_limit(10)).unwrap();
+        add_doc(&index, 2, "a fox again").await;
+        let (after_second, _) = searcher.search(&key, "fox", search_limit(10)).unwrap();
+        rm_doc(&index, 1).await;
+        let (after_removal, _) = searcher.search(&key, "fox", search_limit(10)).unwrap();
+
+        assert!(before.is_empty());
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_second.len(), 2);
+        assert_eq!(after_removal.len(), 1);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn searcher_keeps_every_document_across_the_reloads_of_consolidation() {
+        let index = sender_with_committed_segments(Some(CONSOLIDATION_TEST_TARGET)).await;
+        let searcher = Arc::clone(&index.0.searcher);
+        let key = make_index_key();
+        let docs = CONSOLIDATION_TEST_SEGMENTS as usize * TEST_COMMIT_THRESHOLD;
+        let (before, _) = searcher.search(&key, "body", search_limit(100)).unwrap();
+
+        index.consolidate(make_index_key()).await.unwrap();
+        let deadline = tokio::time::Instant::now() + MERGE_SETTLE_TIMEOUT;
+        while segment_count(&index).await > CONSOLIDATION_TEST_TARGET.get() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(TEST_COMMIT_INTERVAL).await;
+        }
+        let (after, _) = searcher.search(&key, "body", search_limit(100)).unwrap();
+
+        assert_eq!(before.len(), docs);
+        assert_eq!(sorted_ids(after), sorted_ids(before));
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn searcher_does_not_see_documents_rejected_for_memory() {
+        let table = make_table_with_keys();
+        let handles = new(
+            make_configuration(),
+            table,
+            worker::new(),
+            make_memory_actor_cannot_allocate(),
+            TEST_COMMIT_INTERVAL,
+            TEST_COMMIT_THRESHOLD,
+            FtsTuning::default(),
+        );
+
+        add_doc(&handles.actor, 1, "should not be indexed").await;
+        let (keys, _) = handles
+            .searcher
+            .search(&make_index_key(), "indexed", search_limit(10))
+            .unwrap();
+
+        assert!(keys.is_empty());
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn searcher_answers_while_the_actor_is_blocked() {
+        let (stalled_worker, _never_run) = async_channel::bounded(1);
+        let handles = new(
+            make_configuration(),
+            make_table_with_keys(),
+            stalled_worker,
+            make_memory_actor(),
+            TEST_COMMIT_INTERVAL,
+            TEST_COMMIT_THRESHOLD,
+            FtsTuning::default(),
+        );
+        for primary in 1..=3 {
+            let (tx, _rx) = mpsc::channel(1);
+            handles
+                .actor
+                .add_document(primary.into(), "fox".into(), AsyncInProgress::Fullscan(tx))
+                .await
+                .unwrap();
+        }
+
+        let (keys, _) = handles
+            .searcher
+            .search(&make_index_key(), "fox", search_limit(10))
+            .unwrap();
+
+        assert!(keys.is_empty());
     }
 
     fn state_with_committed_segments() -> Arc<IndexState> {

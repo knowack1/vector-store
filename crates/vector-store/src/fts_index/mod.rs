@@ -17,6 +17,7 @@ pub(crate) use actor::FtsIndex;
 pub(crate) use actor::FtsIndexExt;
 pub(crate) use factory::FtsIndexConfiguration;
 pub(crate) use factory::FtsIndexFactory;
+pub(crate) use factory::FtsSearcher;
 pub(crate) use tantivy::QueryError;
 use tantivy::TantivyIndexFactory;
 use tokio::sync::mpsc;
