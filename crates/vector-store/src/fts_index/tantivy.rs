@@ -1404,7 +1404,7 @@ mod tests {
     }
 
     const NOT_QUERY_DOCS: u64 = 24;
-    const NOT_QUERY_LIMITS: [usize; 4] = [1, 3, 10, 100];
+    const RANKING_LIMITS: [usize; 4] = [1, 3, 10, 100];
 
     fn contains_excluded_word(id: u64) -> bool {
         id % 3 == 0
@@ -1461,15 +1461,116 @@ mod tests {
             surviving_keys.len() + excluded.len(),
             NOT_QUERY_DOCS as usize
         );
-        for limit in NOT_QUERY_LIMITS {
+        assert_ranking_at_limits(
+            &index,
+            &key,
+            "alpha NOT beta",
+            &surviving_keys,
+            &surviving_scores,
+        )
+        .await;
+    }
+
+    async fn assert_ranking_at_limits(
+        index: &TestIndex,
+        key: &IndexKey,
+        query: &str,
+        expected_keys: &[PrimaryKey],
+        expected_scores: &[f32],
+    ) {
+        for limit in RANKING_LIMITS {
             let (keys, scores) = index
-                .search(key.clone(), "alpha NOT beta".into(), search_limit(limit))
+                .search(key.clone(), query.into(), search_limit(limit))
                 .await
                 .unwrap();
-            let expected_len = limit.min(surviving_keys.len());
-            assert_eq!(keys, surviving_keys[..expected_len], "limit {limit}");
-            assert_nearly_equal_scores(&scores, &surviving_scores[..expected_len]);
+            let expected_len = limit.min(expected_keys.len());
+            assert_eq!(keys, expected_keys[..expected_len], "{query} limit {limit}");
+            assert_nearly_equal_scores(&scores, &expected_scores[..expected_len]);
         }
+    }
+
+    const AND_QUERY_DOCS: u64 = 36;
+
+    fn contains_first_word(id: u64) -> bool {
+        id % 4 != 3
+    }
+
+    fn contains_second_word(id: u64) -> bool {
+        !id.is_multiple_of(3)
+    }
+
+    /// A distinct length per document keeps the BM25 scores apart.
+    fn and_query_doc(id: u64) -> String {
+        let first = if contains_first_word(id) {
+            vec!["alpha"; 1 + (id % 4) as usize]
+        } else {
+            vec![]
+        };
+        let second = if contains_second_word(id) {
+            vec!["beta"; 1 + (id % 2) as usize]
+        } else {
+            vec![]
+        };
+        let filler = vec!["filler"; id as usize];
+        [first, second, filler].concat().join(" ")
+    }
+
+    async fn single_word_ranking(
+        index: &TestIndex,
+        key: &IndexKey,
+        word: &str,
+    ) -> Vec<(PrimaryKey, f32)> {
+        let (keys, scores) = index
+            .search(key.clone(), word.into(), search_limit(100))
+            .await
+            .unwrap();
+        keys.into_iter().zip(scores).collect()
+    }
+
+    /// The documents holding both words, each scored with the sum of its two single-word scores.
+    fn intersection_ranking(
+        first: &[(PrimaryKey, f32)],
+        second: &[(PrimaryKey, f32)],
+    ) -> (Vec<PrimaryKey>, Vec<f32>) {
+        let mut hits: Vec<(PrimaryKey, f32)> = first
+            .iter()
+            .filter_map(|(primary_key, first_score)| {
+                second
+                    .iter()
+                    .find(|(other_key, _)| other_key == primary_key)
+                    .map(|(_, second_score)| (primary_key.clone(), first_score + second_score))
+            })
+            .collect();
+        hits.sort_by(|left, right| right.1.total_cmp(&left.1));
+        hits.into_iter().unzip()
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn and_query_returns_the_intersection_ranking() {
+        let index = make_sender(make_table_with_keys());
+        for id in 0..AND_QUERY_DOCS {
+            add_doc(&index, id, &and_query_doc(id)).await;
+        }
+        let key = make_index_key();
+        let first = single_word_ranking(&index, &key, "alpha").await;
+        let second = single_word_ranking(&index, &key, "beta").await;
+
+        let (expected_keys, expected_scores) = intersection_ranking(&first, &second);
+
+        let expected_count = (0..AND_QUERY_DOCS)
+            .filter(|&id| contains_first_word(id) && contains_second_word(id))
+            .count();
+        assert_eq!(expected_keys.len(), expected_count);
+        assert_ranking_at_limits(
+            &index,
+            &key,
+            "alpha AND beta",
+            &expected_keys,
+            &expected_scores,
+        )
+        .await;
     }
 
     #[rstest]
