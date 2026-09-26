@@ -14,6 +14,9 @@
 //! The hits and their scores are the ones `TopDocs::with_limit(k).order_by_score()`
 //! returns for the `TermQuery`, down to ties and to the documents its block-max pruning
 //! may skip: the per-segment pruning and both top-k stages follow tantivy's rules.
+//! Like tantivy's `block_wand_single_scorer`, it moves past a block whose maximum score
+//! cannot beat the threshold without decoding it, but it scores a decoded block in one
+//! tight loop over its doc ids and term frequencies.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -33,6 +36,10 @@ use tantivy::postings::BlockSegmentPostings;
 use tantivy::postings::TermInfo;
 use tantivy::query::Bm25Weight;
 use tantivy::schema::IndexRecordOption;
+
+/// Tantivy's `COMPRESSION_BLOCK_SIZE`, the number of documents in a full postings block,
+/// which the crate keeps private.
+const POSTINGS_BLOCK_LEN: u32 = 128;
 
 /// Whether `field` of `searcher`'s schema records term frequencies, which BM25 scores
 /// the postings with.
@@ -144,13 +151,20 @@ fn segment_top_k(
         .inverted_index
         .read_block_postings_from_terminfo(&segment.term_info, IndexRecordOption::WithFreqs)?;
     let mut top_k = SegmentTopK::new(limit);
-    while postings.block_len() > 0 {
+    for _ in 0..block_count(postings.doc_freq()) {
         if top_k.may_improve(&mut postings, &fieldnorms, bm25) {
+            postings.load_block();
             collect_block(&postings, &fieldnorms, bm25, segment.reader, &mut top_k);
         }
-        postings.advance();
+        postings.shallow_advance();
     }
     Ok(top_k.into_vec())
+}
+
+/// The number of blocks of a posting list: full blocks of `POSTINGS_BLOCK_LEN` documents,
+/// then one partial block when `doc_freq` is not a multiple of it.
+fn block_count(doc_freq: u32) -> u32 {
+    doc_freq.div_ceil(POSTINGS_BLOCK_LEN)
 }
 
 /// The field norms `TermWeight` scores with: the segment's, or a constant 1 when the
