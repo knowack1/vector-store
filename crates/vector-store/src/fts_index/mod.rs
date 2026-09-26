@@ -7,6 +7,7 @@ mod actor;
 mod bare_word;
 mod consolidation;
 mod factory;
+mod page_directory;
 mod tantivy;
 mod term_top_k;
 

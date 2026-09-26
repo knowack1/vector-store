@@ -20,6 +20,7 @@ use std::time::Duration;
 use anyhow::anyhow;
 use tantivy::DocAddress;
 use tantivy::FutureResult;
+use tantivy::IndexSettings;
 use tantivy::IndexWriter;
 use tantivy::ReloadPolicy;
 use tantivy::Score;
@@ -87,6 +88,7 @@ use super::actor::FtsStats;
 use super::actor::FtsStatsR;
 use super::bare_word;
 use super::consolidation;
+use super::page_directory::PageDirectory;
 use super::term_top_k;
 
 pub(crate) struct TantivyIndexFactory {
@@ -184,7 +186,12 @@ impl IndexState {
     fn new(analyzer: Analyzer, positions: Positions, tuning: FtsTuning) -> anyhow::Result<Self> {
         let tokenizer = analyzer.to_string();
         let schema = build_schema(&tokenizer, positions);
-        let index = tantivy::Index::create_in_ram(schema.clone());
+        let index = tantivy::Index::create(
+            PageDirectory::default(),
+            schema.clone(),
+            IndexSettings::default(),
+        )
+        .map_err(|e| anyhow!("fts: failed to create index: {e}"))?;
         index
             .tokenizers()
             .register(&tokenizer, build_token_pipeline(analyzer)?);
