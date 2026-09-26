@@ -1043,8 +1043,17 @@ async fn post_index_bm25(
     Path((keyspace, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
     extract::Json(request): extract::Json<httpapi::PostIndexBm25Request>,
 ) -> Response {
-    let keyspace: crate::KeyspaceName = keyspace.into();
-    let index_name: crate::IndexName = index_name.into();
+    bm25(state, protocol, keyspace.into(), index_name.into(), request).await
+}
+
+/// The body of [`post_index_bm25`], once its extractors have run.
+async fn bm25(
+    state: RoutesInnerState,
+    protocol: Option<Extension<Protocol>>,
+    keyspace: crate::KeyspaceName,
+    index_name: crate::IndexName,
+    request: httpapi::PostIndexBm25Request,
+) -> Response {
     if let Some(resp) = check_insecure_tls(state.use_tls, protocol, "post_index_bm25") {
         return resp;
     }
