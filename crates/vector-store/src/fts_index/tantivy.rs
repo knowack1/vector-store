@@ -92,13 +92,22 @@ impl FtsIndexFactory for TantivyIndexFactory {
         index: FtsIndexConfiguration,
         table: Arc<RwLock<Table>>,
     ) -> mpsc::Sender<FtsIndex> {
+        info!(
+            "fts: ingest tuning for {}: commit_interval={:?} commit_threshold={} writer_memory={} MB per thread",
+            index.key,
+            self.tuning.commit_interval,
+            self.tuning
+                .commit_threshold
+                .map_or("disabled".to_string(), |docs| docs.to_string()),
+            self.tuning.writer_memory_bytes / 1_000_000
+        );
         new(
             index,
             table,
             self.worker.clone(),
             self.memory.clone(),
-            COMMIT_INTERVAL,
-            MAX_UNCOMMITTED_THRESHOLD,
+            self.tuning.commit_interval,
+            self.tuning.commit_threshold_docs(),
             self.tuning,
         )
     }
@@ -151,9 +160,6 @@ struct IndexState {
     reader: tantivy::IndexReader,
     schema: Schema,
 }
-
-const COMMIT_INTERVAL: Duration = Duration::from_secs(3);
-const MAX_UNCOMMITTED_THRESHOLD: usize = 10_000;
 
 impl IndexState {
     fn new(analyzer: Analyzer, positions: Positions, tuning: FtsTuning) -> anyhow::Result<Self> {
@@ -1039,6 +1045,7 @@ mod tests {
     async fn writer_accepts_the_configurable_memory_budget_bounds(#[case] bytes: usize) {
         let tuning = FtsTuning {
             writer_memory_bytes: bytes,
+            ..FtsTuning::default()
         };
 
         let state = IndexState::new(Analyzer::default(), Positions::default(), tuning);

@@ -206,16 +206,30 @@ pub struct FtsTuning {
     /// Tantivy's indexing buffer per writer thread, in bytes. A thread flushes its
     /// segment as soon as the buffer is full, so a small budget means many small segments.
     pub writer_memory_bytes: usize,
+    /// How often uncommitted documents are committed and become searchable.
+    pub commit_interval: std::time::Duration,
+    /// Uncommitted documents that force a commit before the interval elapses;
+    /// `None` leaves the interval as the only commit trigger.
+    pub commit_threshold: Option<usize>,
 }
 
 impl FtsTuning {
     pub const DEFAULT_WRITER_MEMORY_MB: usize = 256;
+    pub const DEFAULT_COMMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+    pub const DEFAULT_COMMIT_THRESHOLD: usize = 10_000;
+
+    /// The pending-document count that triggers a commit; unreachable when the threshold is disabled.
+    pub fn commit_threshold_docs(&self) -> usize {
+        self.commit_threshold.unwrap_or(usize::MAX)
+    }
 }
 
 impl Default for FtsTuning {
     fn default() -> Self {
         Self {
             writer_memory_bytes: Self::DEFAULT_WRITER_MEMORY_MB * 1_000_000,
+            commit_interval: Self::DEFAULT_COMMIT_INTERVAL,
+            commit_threshold: Some(Self::DEFAULT_COMMIT_THRESHOLD),
         }
     }
 }

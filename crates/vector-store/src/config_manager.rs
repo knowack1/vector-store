@@ -46,9 +46,42 @@ fn fts_writer_memory_bytes(env: &impl Fn(&str) -> anyhow::Result<String>) -> any
     Ok(megabytes * 1_000_000)
 }
 
+const FTS_COMMIT_INTERVAL_ENV: &str = "VECTOR_STORE_FTS_COMMIT_INTERVAL";
+const FTS_COMMIT_THRESHOLD_ENV: &str = "VECTOR_STORE_FTS_COMMIT_THRESHOLD";
+
+fn fts_commit_interval(env: &impl Fn(&str) -> anyhow::Result<String>) -> anyhow::Result<Duration> {
+    let Ok(value) = env(FTS_COMMIT_INTERVAL_ENV) else {
+        return Ok(FtsTuning::DEFAULT_COMMIT_INTERVAL);
+    };
+    let interval: Duration = value
+        .trim()
+        .parse::<humantime::Duration>()
+        .map_err(|err| anyhow!("Unable to parse {FTS_COMMIT_INTERVAL_ENV} env (duration): {err}"))?
+        .into();
+    if interval.is_zero() {
+        bail!("{FTS_COMMIT_INTERVAL_ENV} must be greater than zero");
+    }
+    Ok(interval)
+}
+
+/// `0` disables the threshold, leaving the commit interval as the only commit trigger.
+fn fts_commit_threshold(
+    env: &impl Fn(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<Option<usize>> {
+    let Ok(value) = env(FTS_COMMIT_THRESHOLD_ENV) else {
+        return Ok(Some(FtsTuning::DEFAULT_COMMIT_THRESHOLD));
+    };
+    let documents: usize = value.trim().parse().map_err(|err| {
+        anyhow!("Unable to parse {FTS_COMMIT_THRESHOLD_ENV} env (documents): {err}")
+    })?;
+    Ok((documents > 0).then_some(documents))
+}
+
 fn fts_tuning(env: &impl Fn(&str) -> anyhow::Result<String>) -> anyhow::Result<FtsTuning> {
     Ok(FtsTuning {
         writer_memory_bytes: fts_writer_memory_bytes(env)?,
+        commit_interval: fts_commit_interval(env)?,
+        commit_threshold: fts_commit_threshold(env)?,
     })
 }
 
@@ -1075,6 +1108,73 @@ mod tests {
         let env = mock_env(HashMap::from([(FTS_WRITER_MEMORY_MB_ENV, value.into())]));
         let err = load_config(env).await.unwrap_err();
         assert!(err.to_string().contains(message), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn load_config_fts_commit_policy_defaults_to_3_s_and_10000_documents() {
+        let env = mock_env(HashMap::new());
+        let config = load_config(env).await.unwrap();
+        assert_eq!(config.fts_tuning.commit_interval, Duration::from_secs(3));
+        assert_eq!(config.fts_tuning.commit_threshold, Some(10_000));
+    }
+
+    #[rstest::rstest]
+    #[case("1s", Duration::from_secs(1))]
+    #[case(" 250ms ", Duration::from_millis(250))]
+    #[tokio::test]
+    async fn load_config_fts_commit_interval_override(
+        #[case] value: &str,
+        #[case] interval: Duration,
+    ) {
+        let env = mock_env(HashMap::from([(FTS_COMMIT_INTERVAL_ENV, value.into())]));
+        let config = load_config(env).await.unwrap();
+        assert_eq!(config.fts_tuning.commit_interval, interval);
+    }
+
+    #[rstest::rstest]
+    #[case("0s", "must be greater than zero")]
+    #[case("1", "Unable to parse VECTOR_STORE_FTS_COMMIT_INTERVAL")]
+    #[tokio::test]
+    async fn load_config_fts_commit_interval_invalid_errors(
+        #[case] value: &str,
+        #[case] message: &str,
+    ) {
+        let env = mock_env(HashMap::from([(FTS_COMMIT_INTERVAL_ENV, value.into())]));
+        let err = load_config(env).await.unwrap_err();
+        assert!(err.to_string().contains(message), "unexpected error: {err}");
+    }
+
+    #[rstest::rstest]
+    #[case("0", None)]
+    #[case("500", Some(500))]
+    #[tokio::test]
+    async fn load_config_fts_commit_threshold_override(
+        #[case] value: &str,
+        #[case] threshold: Option<usize>,
+    ) {
+        let env = mock_env(HashMap::from([(FTS_COMMIT_THRESHOLD_ENV, value.into())]));
+        let config = load_config(env).await.unwrap();
+        assert_eq!(config.fts_tuning.commit_threshold, threshold);
+    }
+
+    #[test]
+    fn fts_disabled_commit_threshold_is_never_reached() {
+        let tuning = FtsTuning {
+            commit_threshold: None,
+            ..FtsTuning::default()
+        };
+        assert_eq!(tuning.commit_threshold_docs(), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn load_config_fts_commit_threshold_invalid_errors() {
+        let env = mock_env(HashMap::from([(FTS_COMMIT_THRESHOLD_ENV, "-1".into())]));
+        let err = load_config(env).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unable to parse VECTOR_STORE_FTS_COMMIT_THRESHOLD"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
