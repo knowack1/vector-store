@@ -30,6 +30,24 @@ pub(crate) struct FtsStats {
 
 pub(crate) type FtsStatsR = anyhow::Result<FtsStats>;
 
+/// One segment of a full-text index, as the committed meta and the reader see it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct FtsSegment {
+    pub(crate) segment_id: String,
+    pub(crate) max_doc: u32,
+    pub(crate) num_deleted_docs: u32,
+    /// In the committed meta, where background merges keep replacing segments.
+    pub(crate) searchable: bool,
+    /// Held by the reader's current searcher, which queries walk.
+    pub(crate) served: bool,
+    /// Bytes of the segment's files still in the index directory.
+    pub(crate) file_bytes: Option<u64>,
+    /// Bytes the reader's searcher holds for this segment.
+    pub(crate) served_bytes: Option<u64>,
+}
+
+pub(crate) type FtsSegmentsR = anyhow::Result<Vec<FtsSegment>>;
+
 pub(crate) enum FtsIndex {
     AddDocument {
         primary_id: PrimaryId,
@@ -60,6 +78,10 @@ pub(crate) enum FtsIndex {
         index_key: IndexKey,
         tx: oneshot::Sender<FtsStatsR>,
     },
+    Segments {
+        index_key: IndexKey,
+        tx: oneshot::Sender<FtsSegmentsR>,
+    },
 }
 
 pub(crate) trait FtsIndexExt {
@@ -83,6 +105,7 @@ pub(crate) trait FtsIndexExt {
         documents: Vec<String>,
     ) -> FtsHighlightR;
     async fn stats(&self, index_key: IndexKey) -> FtsStatsR;
+    async fn segments(&self, index_key: IndexKey) -> FtsSegmentsR;
 }
 
 impl FtsIndexExt for mpsc::Sender<FtsIndex> {
@@ -152,6 +175,12 @@ impl FtsIndexExt for mpsc::Sender<FtsIndex> {
     async fn stats(&self, index_key: IndexKey) -> FtsStatsR {
         let (tx, rx) = oneshot::channel();
         self.send(FtsIndex::Stats { index_key, tx }).await?;
+        rx.await?
+    }
+
+    async fn segments(&self, index_key: IndexKey) -> FtsSegmentsR {
+        let (tx, rx) = oneshot::channel();
+        self.send(FtsIndex::Segments { index_key, tx }).await?;
         rx.await?
     }
 }

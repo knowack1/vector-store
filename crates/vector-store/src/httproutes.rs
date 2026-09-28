@@ -1563,6 +1563,27 @@ fn new_internals() -> Router<RoutesInnerState> {
         )
         .route("/counters/{id}", put(put_internal_counter))
         .route("/session-counters", get(get_internal_session_counters))
+        .route(
+            "/fts-segments/{keyspace}/{index}",
+            get(get_internal_fts_segments),
+        )
+}
+
+/// Every segment of a full-text index with its documents and bytes: observation only, for benchmarks.
+async fn get_internal_fts_segments(
+    State(state): State<RoutesInnerState>,
+    Path((keyspace, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
+) -> Response {
+    let keyspace: crate::KeyspaceName = keyspace.into();
+    let index_name: crate::IndexName = index_name.into();
+    let key = IndexKey::new(&keyspace, &index_name);
+    let Some((index, _)) = state.engine.get_fts_index(key.clone()).await else {
+        return (StatusCode::NOT_FOUND, format!("no full-text index {key}")).into_response();
+    };
+    match index.segments(key).await {
+        Ok(segments) => (StatusCode::OK, response::Json(segments)).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
 }
 
 async fn get_internal_counters(State(state): State<RoutesInnerState>) -> Response {

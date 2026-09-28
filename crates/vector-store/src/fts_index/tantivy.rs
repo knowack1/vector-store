@@ -10,6 +10,8 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use tantivy::Directory;
+use tantivy::HasLen;
 use tantivy::IndexWriter;
 use tantivy::ReloadPolicy;
 use tantivy::TantivyDocument;
@@ -63,6 +65,8 @@ use crate::worker::WorkerExt;
 use super::actor::FtsHighlightR;
 use super::actor::FtsIndex;
 use super::actor::FtsSearchR;
+use super::actor::FtsSegment;
+use super::actor::FtsSegmentsR;
 use super::actor::FtsStats;
 use super::actor::FtsStatsR;
 use super::counters::CountingMergePolicy;
@@ -480,6 +484,72 @@ fn handle_stats(state: &IndexState) -> FtsStatsR {
     })
 }
 
+/// Bytes of a segment's files still present in the index directory, or `None` once they are gone.
+fn segment_file_bytes(index: &tantivy::Index, meta: &tantivy::index::SegmentMeta) -> Option<u64> {
+    let sizes: Vec<u64> = meta
+        .list_files()
+        .iter()
+        .filter_map(|path| index.directory().open_read(path).ok())
+        .map(|file| file.len() as u64)
+        .collect();
+    (!sizes.is_empty()).then(|| sizes.iter().sum())
+}
+
+fn searchable_segment(index: &tantivy::Index, meta: &tantivy::index::SegmentMeta) -> FtsSegment {
+    FtsSegment {
+        segment_id: meta.id().uuid_string(),
+        max_doc: meta.max_doc(),
+        num_deleted_docs: meta.num_deleted_docs(),
+        searchable: true,
+        served: false,
+        file_bytes: segment_file_bytes(index, meta),
+        served_bytes: None,
+    }
+}
+
+fn served_only_segment(reader: &tantivy::SegmentReader, bytes: u64) -> FtsSegment {
+    FtsSegment {
+        segment_id: reader.segment_id().uuid_string(),
+        max_doc: reader.max_doc(),
+        num_deleted_docs: reader.num_deleted_docs(),
+        searchable: false,
+        served: true,
+        file_bytes: None,
+        served_bytes: Some(bytes),
+    }
+}
+
+fn handle_segments(state: &IndexState) -> FtsSegmentsR {
+    let searcher = state.reader.searcher();
+    let mut segments: BTreeMap<String, FtsSegment> = state
+        .index
+        .searchable_segment_metas()
+        .map_err(|e| anyhow!("fts: failed to list searchable segments: {e}"))?
+        .iter()
+        .map(|meta| {
+            (
+                meta.id().uuid_string(),
+                searchable_segment(&state.index, meta),
+            )
+        })
+        .collect();
+    for reader in searcher.segment_readers() {
+        let bytes = reader
+            .space_usage()
+            .map_err(|e| anyhow!("fts: failed to compute segment space usage: {e}"))?
+            .total()
+            .get_bytes();
+        segments
+            .entry(reader.segment_id().uuid_string())
+            .and_modify(|segment| {
+                segment.served = true;
+                segment.served_bytes = Some(bytes);
+            })
+            .or_insert_with(|| served_only_segment(reader, bytes));
+    }
+    Ok(segments.into_values().collect())
+}
+
 fn get_or_create_state<T: TableSearch>(
     states: &mut BTreeMap<IndexId, Arc<IndexState>>,
     table: &RwLock<T>,
@@ -669,6 +739,19 @@ pub(crate) fn new(
                             worker
                                 .spawn_blocking(move || {
                                     let result = handle_stats(&state);
+                                    _ = tx.send(result);
+                                })
+                                .await;
+                        }
+                        FtsIndex::Segments { index_key, tx } => {
+                            let Some(state) = get_state(&states, table.as_ref(), &index_key)
+                            else {
+                                _ = tx.send(Ok(Vec::new()));
+                                continue;
+                            };
+                            worker
+                                .spawn_blocking(move || {
+                                    let result = handle_segments(&state);
                                     _ = tx.send(result);
                                 })
                                 .await;
@@ -979,6 +1062,32 @@ mod tests {
         assert_eq!(stats.num_docs, 2);
         assert!(stats.segment_count > 0);
         assert!(stats.size_bytes > 0);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn segments_list_docs_and_bytes_of_every_segment() {
+        let table = make_table_with_keys();
+        let sender = make_sender(table);
+        add_doc(&sender, 1, "hello world").await;
+        add_doc(&sender, 2, "foo bar").await;
+
+        let segments = sender.segments(make_index_key()).await.unwrap();
+
+        assert!(!segments.is_empty());
+        assert_eq!(segments.iter().map(|s| s.max_doc).sum::<u32>(), 2);
+        for segment in &segments {
+            assert!(segment.searchable && segment.served, "{segment:?}");
+            assert!(
+                segment.file_bytes.is_some_and(|bytes| bytes > 0),
+                "{segment:?}"
+            );
+            assert!(
+                segment.served_bytes.is_some_and(|bytes| bytes > 0),
+                "{segment:?}"
+            );
+        }
     }
 
     #[rstest]
