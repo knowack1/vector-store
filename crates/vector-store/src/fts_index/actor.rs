@@ -20,6 +20,12 @@ pub(crate) struct FtsStats {
     pub(crate) num_docs: u64,
     pub(crate) size_bytes: u64,
     pub(crate) segment_count: usize,
+    /// Segments in the index's committed meta, which background merges keep replacing;
+    /// `segment_count` is what the reader serves and can lag behind this.
+    pub(crate) searchable_segment_count: usize,
+    pub(crate) reader_reloads: u64,
+    pub(crate) commits: u64,
+    pub(crate) merges_started: u64,
 }
 
 pub(crate) type FtsStatsR = anyhow::Result<FtsStats>;

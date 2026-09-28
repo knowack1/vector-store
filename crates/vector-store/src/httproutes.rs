@@ -594,6 +594,24 @@ async fn refresh_index_metrics(
             .fts_segment_count
             .with_label_values(&labels)
             .set(stats.segment_count as f64);
+        let metrics = &state.metrics;
+        for (gauge, value) in [
+            (
+                &metrics.fts_searchable_segment_count,
+                stats.searchable_segment_count as f64,
+            ),
+            (
+                &metrics.fts_reader_reloads_total,
+                stats.reader_reloads as f64,
+            ),
+            (&metrics.fts_commits_total, stats.commits as f64),
+            (
+                &metrics.fts_merges_started_total,
+                stats.merges_started as f64,
+            ),
+        ] {
+            gauge.with_label_values(&labels).set(value);
+        }
     }
 }
 

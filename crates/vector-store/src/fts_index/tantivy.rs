@@ -65,6 +65,8 @@ use super::actor::FtsIndex;
 use super::actor::FtsSearchR;
 use super::actor::FtsStats;
 use super::actor::FtsStatsR;
+use super::counters::CountingMergePolicy;
+use super::counters::IndexCounters;
 
 pub(crate) struct TantivyIndexFactory {
     worker: async_channel::Sender<Worker>,
@@ -159,6 +161,7 @@ struct IndexState {
     writer: RwLock<Writer>,
     reader: tantivy::IndexReader,
     schema: Schema,
+    counters: Arc<IndexCounters>,
 }
 
 impl IndexState {
@@ -178,9 +181,11 @@ impl IndexState {
             perf::num_workers(),
             tuning.writer_memory_bytes / 1_000_000
         );
-        let writer = index
+        let writer: IndexWriter = index
             .writer_with_options(options)
             .map_err(|e| anyhow!("fts: failed to create writer: {e}"))?;
+        let counters = Arc::new(IndexCounters::default());
+        writer.set_merge_policy(Box::new(CountingMergePolicy::new(Arc::clone(&counters))));
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -194,6 +199,7 @@ impl IndexState {
             }),
             reader,
             schema,
+            counters,
         })
     }
 }
@@ -278,8 +284,9 @@ fn commit(state: &IndexState, key: &IndexKey) {
         .write()
         .unwrap()
         .commit(|| state.reader.reload());
-    if let Err(err) = result {
-        error!("fts: failed to commit for {key}: {err}");
+    match result {
+        Ok(()) => state.counters.record_commit(),
+        Err(err) => error!("fts: failed to commit for {key}: {err}"),
     }
 }
 
@@ -455,10 +462,21 @@ fn handle_stats(state: &IndexState) -> FtsStatsR {
         .map_err(|e| anyhow!("fts: failed to compute space usage: {e}"))?
         .total()
         .get_bytes();
+    let searchable_segment_count = state
+        .index
+        .searchable_segment_ids()
+        .map_err(|e| anyhow!("fts: failed to list searchable segments: {e}"))?
+        .len();
     Ok(FtsStats {
         num_docs,
         size_bytes,
         segment_count,
+        searchable_segment_count,
+        // The reader numbers every searcher it opens, starting at 0, so the live
+        // searcher's generation is the number of reloads so far.
+        reader_reloads: searcher.generation().generation_id(),
+        commits: state.counters.commits(),
+        merges_started: state.counters.merges_started(),
     })
 }
 
@@ -961,6 +979,36 @@ mod tests {
         assert_eq!(stats.num_docs, 2);
         assert!(stats.segment_count > 0);
         assert!(stats.size_bytes > 0);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn stats_count_commits_reloads_and_searchable_segments() {
+        let state = IndexState::new(
+            Analyzer::default(),
+            Positions::default(),
+            FtsTuning::default(),
+        )
+        .unwrap();
+        let key = make_index_key();
+        for primary in 0..2_u64 {
+            let (tx, _rx) = mpsc::channel(1);
+            handle_add_document(
+                &state,
+                PrimaryId::from(primary),
+                format!("document {primary}"),
+                AsyncInProgress::Fullscan(tx),
+            );
+            commit(&state, &key);
+        }
+
+        let stats = handle_stats(&state).unwrap();
+
+        assert_eq!(stats.commits, 2);
+        assert_eq!(stats.reader_reloads, 2);
+        assert_eq!(stats.searchable_segment_count, stats.segment_count);
+        assert_eq!(stats.merges_started, 0);
     }
 
     #[rstest]

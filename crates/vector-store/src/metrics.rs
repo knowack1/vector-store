@@ -27,6 +27,10 @@ pub(crate) struct Metrics {
     pub cdc_last_processed_timestamp_seconds: GaugeVec,
     pub fts_index_size_bytes: GaugeVec,
     pub fts_segment_count: GaugeVec,
+    pub fts_searchable_segment_count: GaugeVec,
+    pub fts_reader_reloads_total: GaugeVec,
+    pub fts_commits_total: GaugeVec,
+    pub fts_merges_started_total: GaugeVec,
     dirty_indexes: Arc<DashSet<(String, String)>>,
 }
 
@@ -159,6 +163,42 @@ impl Metrics {
         )
         .unwrap();
 
+        let fts_searchable_segment_count = GaugeVec::new(
+            prometheus::Opts::new(
+                "fts_searchable_segment_count",
+                "Number of segments in a full-text index's committed meta; the reader may still serve an older set",
+            ),
+            &["keyspace", "index_name"],
+        )
+        .unwrap();
+
+        let fts_reader_reloads_total = GaugeVec::new(
+            prometheus::Opts::new(
+                "fts_reader_reloads_total",
+                "Number of times a full-text index reader has reloaded its searcher",
+            ),
+            &["keyspace", "index_name"],
+        )
+        .unwrap();
+
+        let fts_commits_total = GaugeVec::new(
+            prometheus::Opts::new(
+                "fts_commits_total",
+                "Number of successful full-text index writer commits",
+            ),
+            &["keyspace", "index_name"],
+        )
+        .unwrap();
+
+        let fts_merges_started_total = GaugeVec::new(
+            prometheus::Opts::new(
+                "fts_merges_started_total",
+                "Number of segment merges the full-text index merge policy has started",
+            ),
+            &["keyspace", "index_name"],
+        )
+        .unwrap();
+
         registry.register(Box::new(latency.clone())).unwrap();
         registry.register(Box::new(size.clone())).unwrap();
         registry.register(Box::new(modified.clone())).unwrap();
@@ -179,6 +219,18 @@ impl Metrics {
         registry
             .register(Box::new(fts_segment_count.clone()))
             .unwrap();
+        registry
+            .register(Box::new(fts_searchable_segment_count.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(fts_reader_reloads_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(fts_commits_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(fts_merges_started_total.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -192,6 +244,10 @@ impl Metrics {
             cdc_last_processed_timestamp_seconds,
             fts_index_size_bytes,
             fts_segment_count,
+            fts_searchable_segment_count,
+            fts_reader_reloads_total,
+            fts_commits_total,
+            fts_merges_started_total,
             dirty_indexes: Arc::new(DashSet::new()),
         }
     }
@@ -225,6 +281,14 @@ impl Metrics {
         let _ = self
             .fts_segment_count
             .remove_label_values(&[keyspace, index_name]);
+        for gauge in [
+            &self.fts_searchable_segment_count,
+            &self.fts_reader_reloads_total,
+            &self.fts_commits_total,
+            &self.fts_merges_started_total,
+        ] {
+            let _ = gauge.remove_label_values(&[keyspace, index_name]);
+        }
         for op in OPERATIONS {
             let _ = self
                 .modified

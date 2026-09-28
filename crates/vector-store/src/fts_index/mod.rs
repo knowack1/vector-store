@@ -4,6 +4,7 @@
  */
 
 mod actor;
+mod counters;
 mod factory;
 mod tantivy;
 
